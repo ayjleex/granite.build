@@ -63,6 +63,20 @@ from gbcommon.utils.hf_utils import (
 logger = logging.getLogger(__name__)
 
 
+class _MissingLakehouseUnauthorizedException(Exception):
+    """Placeholder used when the optional `lakehouse` package is absent."""
+
+
+try:
+    # Lakehouse is an optional dependency: it is only required for the
+    # Lakehouse artifact store (--store lh). When it is not installed we fall
+    # back to a sentinel exception so `except UnauthorizedException` clauses
+    # remain valid without importing lakehouse (e.g. for --store hf).
+    from lakehouse.core import UnauthorizedException
+except ModuleNotFoundError:
+    UnauthorizedException = _MissingLakehouseUnauthorizedException
+
+
 @click.group("artifact")
 @click.pass_context
 def cli(ctx):
@@ -375,8 +389,6 @@ def push(
             update_artifact_status(artifact_id, status)
 
     try:
-        from lakehouse.core import UnauthorizedException
-
         total_steps = 6 if calculate_checksum else 5
 
         normalized_tags = []
@@ -485,29 +497,47 @@ def push(
             if not quiet:
                 click.echo(f"HuggingFace token obtained successfully!")
 
-            # Resolve resource group id from the GB space name when not given.
+            # Resolve resource group id from the GB space only when the user did
+            # NOT pass --resource-group-id. An explicit id is used verbatim and is
+            # never reflected back into the cached space table (the user may be
+            # targeting a group other than the space's default).
             if not resource_group_id:
                 org = hf_organization or HF_ORGANIZATION_DEFAULT
-                resolved_space_name = space
-                if not resolved_space_name:
-                    global_space = resolve_space(
-                        artifact_client.github_token, space, callback=echo_callback
-                    )
-                    if global_space is not None:
-                        resolved_space_name = global_space.get("name")
-                if not resolved_space_name:
-                    click.echo(
-                        "❌ Could not determine GB space name to resolve the "
-                        "HuggingFace resource group id. Pass --space, set a "
-                        "default space, or pass --resource-group-id explicitly.",
-                        err=True,
-                    )
-                    sys.exit(1)
-                resource_group_id = lookup_hf_resource_group_id(
-                    github_token=artifact_client.github_token,
-                    space_name=resolved_space_name,
-                    organization=org,
+
+                # Resolve the space from the local cache (populated by
+                # `space list --all --refresh`) to read its cached default
+                # resource group id. Use a non-fatal callback here: if the space
+                # can't be resolved locally (e.g. no profile yet on a fresh CLI),
+                # we must NOT exit — we fall through to the server-side lookup
+                # below with the raw --space value, which works without a cache.
+                def _quiet_resolve_callback(callback_event: str, callback_args: Dict):
+                    pass
+
+                global_space = resolve_space(
+                    artifact_client.github_token,
+                    space,
+                    callback=_quiet_resolve_callback,
                 )
+                resolved_space_name = space
+                if global_space is not None:
+                    resolved_space_name = (
+                        global_space.get("name") or resolved_space_name
+                    )
+                    resource_group_id = global_space.get("hf_default_resource_group_id")
+                if not resource_group_id:
+                    if not resolved_space_name:
+                        click.echo(
+                            "❌ Could not determine GB space name to resolve the "
+                            "HuggingFace resource group id. Pass --space, set a "
+                            "default space, or pass --resource-group-id explicitly.",
+                            err=True,
+                        )
+                        sys.exit(1)
+                    resource_group_id = lookup_hf_resource_group_id(
+                        github_token=artifact_client.github_token,
+                        space_name=resolved_space_name,
+                        organization=org,
+                    )
                 if not resource_group_id:
                     click.echo(
                         f"❌ Could not resolve HuggingFace resource group id for "
@@ -2347,8 +2377,6 @@ def copy(
                 pass  # Ignore unknown events
 
     try:
-        from lakehouse.core import UnauthorizedException
-
         id_format = parse_artifact_identifier(artifact_id)
         if id_format in ["uuid", "uri"]:
             if not quiet:

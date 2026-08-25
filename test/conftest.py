@@ -50,7 +50,7 @@ if not _can_import("kubernetes_asyncio"):
     collect_ignore.append("unit/resilience/test_k8s_retry.py")
     collect_ignore.append("unit/monitoring/test_appwrapper_monitor.py")
     collect_ignore.append("unit/environment/test_cleanup_retry.py")
-    collect_ignore.append("integration/ibm/environment/test_k8s_raycluster_cleanup.py")
+    collect_ignore.append("integration/environment/test_k8s_raycluster_cleanup.py")
 
 if not _can_import("asyncssh"):
     collect_ignore.append("integration/ibm/utils/test_ssh_tunnel.py")
@@ -304,6 +304,14 @@ def pytest_addoption(parser):
         metavar="PATH",
         help="Path to a buildtest.yaml file to run via the generic YAML runner test.",
     )
+    parser.addoption(
+        "--build-yaml",
+        action="store",
+        default=None,
+        metavar="PATH",
+        help="Override the build.yaml a buildtest uses (gbtest's `-f`); resolves "
+        "against CWD instead of the buildtest.yaml's directory.",
+    )
 
 
 def pytest_sessionstart(session):
@@ -383,6 +391,21 @@ def pytest_sessionstart(session):
 
         importlib.reload(gbserver.types.constants)
         importlib.reload(libgbtest.constants)
+
+        # gbcommon.uri.git captures GBSERVER_GITHUB_TOKEN / SPACE_REPO_CONFIG_BRANCH_NAME
+        # as *frozen default args* (e.g. get_gb_space_config_uri) at import time —
+        # which, via the buildconfig -> gbcommon.uri handler-load chain, happens when
+        # this conftest is first imported, BEFORE the token env var is set above.
+        # Reloading constants alone doesn't refresh those already-bound defaults, so
+        # tokenless callers would still see an empty token. Reload git after constants
+        # (so it re-binds the now-set token), then re-run URI handler registration so
+        # URI.uri_handler_classes points at the reloaded classes (uri.py/URI is not
+        # reloaded, so issubclass and resolution stay consistent).
+        import gbcommon.uri.git
+        from gbcommon.uri.uri import URI
+
+        importlib.reload(gbcommon.uri.git)
+        URI._load_urihandlers()
 
         from gbserver.lineage.jobstats import reset_lineage_store
 
@@ -809,13 +832,12 @@ def _mock_lineage(request):
     mock_store.create_jobstats_for_target.return_value = ([], {})
     mock_store.create_jobstats_for_original_artifact.return_value = None
 
+    # NOTE: buildrunner no longer imports get_lineage_store — lineage recording
+    # moved to LineageWatcher, which resolves the store via
+    # gbserver.lineage.jobstats.get_lineage_store (patched above).
     with (
         patch("gbserver.lineage.jobstats.get_lineage_store", return_value=mock_store),
         patch("gbserver.api.artifacts.get_lineage_store", return_value=mock_store),
-        patch(
-            "gbserver.buildrunner.buildrunner.get_lineage_store",
-            return_value=mock_store,
-        ),
         patch(
             "integration.ibm.api.test_artifacts.get_lineage_store",
             return_value=mock_store,

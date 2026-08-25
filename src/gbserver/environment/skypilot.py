@@ -27,6 +27,7 @@ from tenacity import (
 from gbcommon.types.testing import get_exported_gbtest_env_vars
 from gbcommon.uri.uri import URI
 from gbserver.environment.environment import Environment, EventLogLineParserConfig
+from gbserver.spaces.resource_group import resolve_space_resource_group_id
 from gbserver.types.buildconfig import BuildTargetStepConfig
 from gbserver.types.buildevent import EntityRunMetadata
 from gbserver.types.environmentconfig import EnvironmentConfig
@@ -46,6 +47,8 @@ if HAS_SKYPILOT:
     import sky.exceptions
 else:
     sky = None  # type: ignore[assignment]
+
+_DEFAULT_POLL_INTERVAL_SECONDS = 300
 
 
 def _require_skypilot():
@@ -101,6 +104,13 @@ def _download_logs_with_retry(cluster_name: str, job_id: int):
 # provisioning). Purely defensive — retry_workload sets the complete event in a
 # finally, so this should never actually trip.
 RETRY_RELAUNCH_TIMEOUT_SECONDS = 1800
+
+# SSH-provisioned bare HPC schedulers. They don't support SkyPilot autostop, and
+# commonly don't track memory as a consumable resource (RealMemory unset in
+# slurm.conf), so a --memory request fails resource matching. Cloud-specific
+# handling groups them: skip the compute_config memory floor and force autostop
+# off. Compared against the normalized first infra segment (lowercased).
+_SSH_HPC_CLOUDS = ("slurm", "lsf")
 
 # Per-step log-retrieval modes, selected via the ``log_retrieval.mode`` key in
 # the skypilot_monitor config. See _parse_log_retrieval for semantics.
@@ -251,6 +261,248 @@ from gbserver.environment._skypilot_ssh import (
 from gbserver.environment._skypilot_ssh import (
     extract_host_ssh_info as _extract_host_ssh_info,
 )
+
+
+def _escapes_parent(rel_path: str) -> bool:
+    """Return whether a *relative* path climbs out of its base via ``..``.
+
+    ``normpath`` collapses a leading ``./`` and inner ``.``/``..`` segments; a
+    relative path that escapes its base always normalizes to a ``..``-leading
+    result (``..``, ``../x``, ``a/../../b`` -> ``../b``), whereas one that stays
+    inside never does (``a/../b`` -> ``b``). Shared by the ``file_mounts`` source
+    and destination guards so both reject the same escaping paths.
+
+    :param rel_path: a relative path (callers exclude absolute/URI/``~`` inputs).
+    :returns: ``True`` if it would resolve outside its base directory.
+    """
+    rel = os.path.normpath(rel_path)
+    return rel == ".." or rel.startswith(".." + os.sep)
+
+
+def _reject_home_prefixed(path: str, role: str) -> None:
+    """Reject a ``~``/``~/``-prefixed ``file_mounts`` path.
+
+    This launcher never expands ``~``: a ``~`` *source* would resolve to a literal
+    ``~`` directory under the step dir, and a ``~`` *destination* would sidestep
+    the single relative/absolute destination convention (it lands outside the
+    per-run workdir and, on containerized LSF, outside the container). Both roles
+    reject it so ``file_mounts`` has one consistent path model. Shared by the
+    source and destination guards.
+
+    :param path: the source or destination path from a ``file_mounts`` entry.
+    :param role: ``"source"`` or ``"destination"`` — named in the error message.
+    :raises ValueError: if ``path`` equals ``~`` or begins with ``~/``.
+    """
+    if path == "~" or path.startswith("~/"):
+        raise ValueError(
+            f"file_mounts {role} {path!r} uses '~', which is not expanded; "
+            f"use a relative or absolute path instead"
+        )
+
+
+def _resolve_local_mount_source(source: str, asset_dir: Union[Path, str, None]) -> str:
+    """Resolve a ``file_mounts`` local source against the step's asset dir.
+
+    Remote URIs (``s3://``, ``gs://``, ``file://``, ``http…``) and absolute paths
+    are returned unchanged. A relative local path is joined onto ``asset_dir`` —
+    the per-run directory holding the rendered ``step.yaml`` and its sibling
+    files — so a path written in ``step.yaml`` is interpreted relative to the
+    ``step.yaml``'s own location (matching how bash/k8s treat step-relative
+    assets).
+
+    A ``~``/``~/``-prefixed source is rejected: this launcher resolves relative
+    sources against the step dir and never expands ``~`` for sources, so it would
+    otherwise become a literal ``<asset_dir>/~/…`` path rather than a home dir.
+    A relative source that uses ``..`` to climb out of the step dir (e.g.
+    ``../other``) is also rejected, so sources stay confined to the step's own
+    assets. Use an absolute path or a step-relative one instead.
+
+    :param source: the local/remote source string from a ``file_mounts`` entry.
+    :param asset_dir: ``targetsteprun_asset_dir`` (a ``Path`` or ``file://``
+        string), or ``None`` when unavailable (e.g. a retry with no stashed dir).
+    :returns: the resolved source string (unchanged for URIs and absolute paths).
+    :raises ValueError: if ``source`` is ``~``/``~/``-prefixed or escapes the
+        step dir via ``..``.
+    """
+    parsed = urllib.parse.urlparse(source)
+    if parsed.scheme:  # remote URI (s3/gs/file/http/…) — leave as-is
+        return source
+    if os.path.isabs(source):
+        return source  # absolute host path — author's explicit choice
+    _reject_home_prefixed(source, "source")
+    if _escapes_parent(source):
+        raise ValueError(
+            f"file_mounts source {source!r} uses '..' to escape the step "
+            f"directory; use a path inside the step directory or an absolute "
+            f"source"
+        )
+    if asset_dir is None:
+        logger.warning(
+            "Relative file_mount source %r but no asset dir available; "
+            "leaving it unresolved",
+            source,
+        )
+        return source
+    # Tolerate a file:// URI form for asset_dir, matching the bash launcher.
+    base = Path(urllib.parse.urlparse(str(asset_dir)).path)
+    return str(base / source)
+
+
+def _remap_relative_dest(dst: str, build_workdir: Optional[str]) -> str:
+    """Map a relative ``file_mounts`` destination into the per-run workdir.
+
+    Relative destinations (e.g. ``payload``, ``./payload``, ``sub/payload``) are
+    rewritten to ``${build_workdir}/<dst>`` — an absolute path on the shared
+    filesystem — so the payload is reachable at exactly ``./<dst>`` from the run
+    script's CWD (``$GB_BUILD_WORKDIR``), giving implicit per-target isolation.
+
+    On the LSF/enroot backend the shared ``/proj`` tree is bind-mounted identity
+    into the step container, so a payload written to ``${build_workdir}`` on the
+    (sudo-less) login node is visible to the job at the same path; the SkyPilot
+    backend's symlink-wrap is exempted for these shared roots (see the fork's
+    ``sky/provision/lsf`` runner hook), so no container staging or copy-back is
+    needed.
+
+    Absolute destinations pass through unchanged (the author's explicit fixed
+    location). When ``build_workdir`` is unset (envs without ``shared_workdir``) a
+    relative destination is likewise returned unchanged, preserving SkyPilot's own
+    ``~/sky_workdir/`` rewrite.
+
+    A ``~``/``~/``-prefixed destination is rejected, mirroring the source guard in
+    :func:`_resolve_local_mount_source`: ``~`` is never expanded by this launcher,
+    so ``file_mounts`` has a single destination convention — relative, or absolute
+    for a fixed location. A relative destination that uses ``..`` to climb out of
+    its target directory (e.g. ``../foo``) is likewise rejected — whether or not a
+    remap applies — so it can leave neither the per-run workdir nor SkyPilot's
+    default rewrite. These are authoring guards, not a security boundary; the step
+    author controls the destination.
+
+    :param dst: the destination key from the raw ``file_mounts`` mapping.
+    :param build_workdir: absolute per-run workdir, or ``None`` to disable remap.
+    :returns: the (possibly rewritten) destination path.
+    :raises ValueError: if ``dst`` is ``~``/``~/``-prefixed, or a relative ``dst``
+        escapes its target directory via ``..`` traversal.
+    """
+    _reject_home_prefixed(dst, "destination")
+    if os.path.isabs(dst):
+        return dst  # absolute: author's explicit fixed location, left as-is
+    # Reject ``..`` escapes regardless of whether a build_workdir remap follows,
+    # so the destination can leave neither the per-run workdir nor SkyPilot's
+    # default rewrite.
+    if _escapes_parent(dst):
+        raise ValueError(
+            f"file_mounts destination {dst!r} uses '..' to escape its target "
+            f"directory; use a path without a leading '..' or an absolute "
+            f"destination"
+        )
+    if not build_workdir:
+        return dst  # no shared workdir: leave to SkyPilot's default handling
+    return os.path.normpath(os.path.join(build_workdir, dst))
+
+
+def _get_cli_prefix(build_workdir: Optional[str]) -> str:
+    """Build the shell snippet prepended to each step's setup and run scripts.
+
+    The snippet always leads with ``set -eu`` so any failure in the prefix aborts
+    before the step body runs, rather than silently executing the body in a wrong
+    or unexpected state. The prefix is prepended ahead of each body's own
+    ``set -eu``, so without this the body's flags would not yet be in effect while
+    the prefix runs.
+
+    When a ``build_workdir`` was provisioned (the env configures
+    ``shared_workdir``), the snippet also emits ``mkdir -p`` + ``cd
+    "$GB_BUILD_WORKDIR"`` so both the ``setup`` and ``run`` scripts start in that
+    per-run workdir. Making the launcher own the ``cd`` lets step authors write
+    outputs with relative paths and stay agnostic about where the step runs: they
+    never need to reference ``$GB_BUILD_WORKDIR`` themselves. With ``set -eu`` in
+    front, a failing ``mkdir``/``cd`` (or an unset ``$GB_BUILD_WORKDIR``) aborts
+    fast instead of leaving the body running in the wrong directory.
+
+    When no ``build_workdir`` is set (envs without ``shared_workdir``), no ``cd``
+    is emitted — only ``set -eu``. SkyPilot then runs the scripts in its own
+    default working directory (``~/sky_workdir``), which is exactly where its
+    relative ``file_mounts`` rewrite places payloads (see ``_remap_relative_dest``,
+    which leaves relative destinations untouched in this case). Injecting a ``cd``
+    elsewhere (e.g. ``$HOME``) would move the CWD away from the mounted payloads,
+    so relative-in/relative-out steps would fail to find them; not cd'ing keeps
+    the run CWD aligned with the mount location.
+
+    :param build_workdir: the provisioned per-run workdir path, or ``None`` when
+        no ``shared_workdir`` is configured (no ``cd`` is emitted).
+    :returns: a shell snippet terminated by a trailing newline; always at least
+        ``set -eu``, plus ``mkdir``/``cd`` when a ``build_workdir`` is set.
+    """
+    prefix = "set -eu\n"
+    if build_workdir:
+        prefix += 'mkdir -p "$GB_BUILD_WORKDIR"\ncd "$GB_BUILD_WORKDIR"\n'
+    return prefix
+
+
+def _build_skypilot_mounts(
+    file_mounts_raw: dict,
+    asset_dir: Union[Path, str, None],
+    build_workdir: Optional[str] = None,
+) -> Tuple[Dict, Dict]:
+    """Split a raw ``file_mounts`` mapping into file mounts and storage mounts.
+
+    String values are local-to-remote copies (``Task.set_file_mounts``); dict
+    values (``{source, mode}``) become ``sky.Storage`` storage mounts
+    (``Task.set_storage_mounts``). Relative local sources are resolved via
+    :func:`_resolve_local_mount_source`; bucket URIs keep the existing sub-path
+    extraction (``MOUNT`` mode requires a bucket-only source). When
+    ``build_workdir`` is given, relative *destinations* are remapped under it via
+    :func:`_remap_relative_dest`.
+
+    :param file_mounts_raw: the raw ``file_mounts`` mapping from the config.
+    :param asset_dir: ``targetsteprun_asset_dir`` used to resolve relative sources.
+    :param build_workdir: per-run workdir for relative-destination remap, or
+        ``None`` to leave destinations unchanged.
+    :returns: a ``(file_mounts, storage_mounts)`` tuple of dicts, either of which
+        may be empty.
+    """
+    file_mounts: Dict[str, str] = {}
+    storage_mounts: Dict[str, Any] = {}
+    for raw_path, mount_val in file_mounts_raw.items():
+        mount_path = _remap_relative_dest(raw_path, build_workdir)
+        if isinstance(mount_val, dict):
+            source = mount_val["source"]
+            storage_kwargs: Dict[str, Any] = {
+                "mode": sky.StorageMode[mount_val.get("mode", "MOUNT").upper()],
+            }
+            parsed = urllib.parse.urlparse(source)
+            if parsed.scheme:  # bucket URI: extract the bucket-only source
+                sub_path = parsed.path.lstrip("/")
+                if sub_path:
+                    storage_kwargs["source"] = f"{parsed.scheme}://{parsed.netloc}"
+                    storage_kwargs["_bucket_sub_path"] = sub_path
+                else:
+                    storage_kwargs["source"] = source
+            else:  # local path: resolve relative to the step.yaml dir
+                storage_kwargs["source"] = _resolve_local_mount_source(
+                    source, asset_dir
+                )
+            storage_mounts[mount_path] = sky.Storage(**storage_kwargs)
+        else:
+            file_mounts[mount_path] = _resolve_local_mount_source(mount_val, asset_dir)
+    return file_mounts, storage_mounts
+
+
+def aws_credentials_present() -> bool:
+    """Return True when boto3 would resolve AWS credentials from the environment.
+
+    Checks the credential environment variables boto3 reads: an explicit access
+    key pair (``AWS_ACCESS_KEY_ID`` + ``AWS_SECRET_ACCESS_KEY``) or a named
+    profile (``AWS_PROFILE``). It does not validate the credentials — only that
+    boto3 has something to try. Useful for gating operations (and tests) that
+    require a real AWS backend so they can be skipped cleanly when no
+    credentials are configured.
+
+    :returns: True if AWS credential env vars are set, False otherwise.
+    """
+    has_key_pair = bool(os.environ.get("AWS_ACCESS_KEY_ID")) and bool(
+        os.environ.get("AWS_SECRET_ACCESS_KEY")
+    )
+    return has_key_pair or bool(os.environ.get("AWS_PROFILE"))
 
 
 class Skypilot(Environment):
@@ -478,6 +730,102 @@ class Skypilot(Environment):
         except Exception as e:  # don't fail the build for cleanup
             logger.warning("teardown_skypilot rm -rf %s failed: %s", workdir, e)
 
+    @staticmethod
+    def _parse_memory_gib(memory_str: str) -> Optional[float]:
+        """Convert a ``total_memory_per_node`` string to a GiB number for
+        ``sky.Resources(memory=...)``.
+
+        SkyPilot treats ``memory`` as a GB number (or string). We map common
+        Kubernetes/plain suffixes to a bare number, treating ``Gi`` as GB to
+        match docker's :meth:`Docker._parse_memory` convention.
+
+        :param memory_str: e.g. ``"1Gi"``, ``"512Mi"``, ``"4G"``, ``"4GB"``,
+            ``"4"``. Empty string means "unset".
+        :returns: the size in GiB (e.g. ``1.0``, ``0.5``, ``4.0``), or ``None``
+            when ``memory_str`` is empty or cannot be parsed as a number.
+        """
+        if not memory_str:
+            return None
+        text = memory_str.strip()
+        for suffix, factor in (
+            ("Gi", 1.0),
+            ("G", 1.0),
+            ("GB", 1.0),
+            ("Mi", 1.0 / 1024),
+            ("M", 1.0 / 1024),
+        ):
+            if text.endswith(suffix):
+                text = text[: -len(suffix)]
+                try:
+                    return float(text) * factor
+                except ValueError:
+                    return None
+        try:
+            return float(text)
+        except ValueError:
+            return None
+
+    def _resources_from_compute_config(
+        self: Self, compute_config: Dict, cloud: str = ""
+    ) -> Dict:
+        """Derive a ``sky.Resources`` floor from a step's ``compute_config``.
+
+        Reads the raw dict (NOT the :class:`ComputeConfig` model, whose defaults
+        of 8 GPUs / 512G memory would over-size a bare command). Only emits keys
+        that are explicitly and validly set, so the caller can layer this as the
+        lowest-precedence floor. Both ``cpus`` and ``memory`` are emitted as
+        SkyPilot minimums (``"{n}+"``) so catalog matching selects the smallest
+        instance with *at least* that much CPU/RAM — a bare number is an EXACT
+        match no cloud catalog satisfies for odd sizes ("Catalog does not contain
+        any instances satisfying the request: 1x AWS(mem=1.0)" / ``cpus=3``). The
+        ``"+"`` form crashes SkyPilot's LSF cloud, so on slurm/lsf ``cpus`` stays
+        a bare int (those schedulers match CPUs directly, not via a cloud
+        catalog) and ``memory`` is skipped entirely (below).
+
+        :param compute_config: the step's ``config.compute_config`` dict.
+        :param cloud: the normalized target cloud (lowercased first infra
+            segment, e.g. ``"slurm"``, ``"lsf"``, ``"k8s"``).
+        :returns: a dict optionally containing ``cpus`` (a ``"{n}+"`` minimum on
+            cloud catalogs, or a bare int on slurm/lsf, when ``num_cpus_per_node``
+            > 0) and ``memory`` (a ``"{n}+"`` GiB-minimum string, when
+            ``total_memory_per_node`` parses and the cloud is not slurm/lsf).
+        """
+        resources: Dict = {}
+        num_cpus = compute_config.get("num_cpus_per_node", 0)
+        if isinstance(num_cpus, int) and num_cpus > 0:
+            # Same exact-match trap as memory (below): a bare number is an EXACT
+            # request and no cloud catalog has an instance with, e.g., exactly 3
+            # vCPUs, so SkyPilot dies with "Catalog does not contain any
+            # instances satisfying the request". Emit a minimum ("{n}+") so it
+            # picks the smallest instance with at least that many vCPUs. slurm/lsf
+            # keep the bare int: the "+" form crashes the fork's LSF cloud, and
+            # those schedulers match CPUs directly, so an exact request is fine.
+            if cloud in _SSH_HPC_CLOUDS:
+                resources["cpus"] = num_cpus
+            else:
+                resources["cpus"] = f"{num_cpus}+"
+        # SLURM/LSF (bare HPC schedulers) commonly don't track memory as a
+        # consumable resource (RealMemory unset in slurm.conf), so a --memory
+        # request fails at resource matching ("Catalog does not contain any
+        # instances satisfying ..."). Skip the compute_config memory floor for
+        # them; an explicit launcher/build resources.memory still applies (and
+        # works on clusters that do configure memory).
+        if cloud not in _SSH_HPC_CLOUDS:
+            memory = self._parse_memory_gib(
+                compute_config.get("total_memory_per_node", "")
+            )
+            if memory is not None:
+                # Emit as a minimum ("{n}+"), not an exact float: an exact
+                # memory=1.0 matches no cloud instance type (SkyPilot dies with
+                # "Catalog does not contain any instances satisfying ...
+                # AWS(mem=1.0)"). Format without an exponent and strip the
+                # trailing ".0"/zeros (1.0 -> "1+", 0.5 -> "0.5+"); ":g" would
+                # switch large values to scientific notation (e.g. "1e+06+")
+                # which SkyPilot cannot parse. Safe here: slurm/lsf excluded.
+                mem_str = f"{memory:f}".rstrip("0").rstrip(".")
+                resources["memory"] = f"{mem_str}+"
+        return resources
+
     async def launch_skypilot(
         self: Self,
         launch_id: str,
@@ -535,8 +883,12 @@ class Skypilot(Environment):
             self._ensure_inline_configs_materialized()
             _ensure_skypilot_api_running()
 
-            # Stash kwargs so retry_workload can replay this launch.
+            # Stash kwargs so retry_workload can replay this launch. Include
+            # targetsteprun_asset_dir so a relaunch re-resolves relative
+            # file_mounts sources (it is a named param, so it is replayed via
+            # launch_skypilot(launch_id, **original_kwargs)).
             self._launch_kwargs[launch_id] = {
+                "targetsteprun_asset_dir": targetsteprun_asset_dir,
                 "launcher_config": kwargs.get("launcher_config"),
                 "config": kwargs.get("config"),
                 "run_metadata": kwargs.get("run_metadata"),
@@ -558,28 +910,56 @@ class Skypilot(Environment):
                 "idle_minutes_to_autostop", self._get_idle_minutes()
             )
 
-            # Build sky.Resources — merge build-level overrides on top of
-            # step defaults (config.launcher_config.resources wins over
-            # step's environment_configs.*.launchers.*.config.resources)
-            res_config = {
+            # Higher-precedence resource layers that override the compute_config
+            # floor. infra/cluster/zone come only from these (never the floor), so
+            # the target cloud can be resolved before the floor is layered in.
+            compute_config = config.get("compute_config", {}) or {}
+            override_res = {
                 **launcher_config.get("resources", {}),
                 **config.get("launcher_config", {}).get("resources", {}),
             }
 
             # Build infra string: supports 'cloud/cluster/partition' format
             # (e.g., 'slurm/mycluster/gpu', 'lsf/bluevela/normal')
-            infra = res_config.get("infra") or cloud
-            zone = res_config.get("zone")
-            if not res_config.get("infra") and res_config.get("cluster"):
-                infra = f"{cloud}/{res_config['cluster']}"
+            infra = override_res.get("infra") or cloud
+            zone = override_res.get("zone")
+            if not override_res.get("infra") and override_res.get("cluster"):
+                infra = f"{cloud}/{override_res['cluster']}"
                 if zone:
                     infra = f"{infra}/{zone}"
                     zone = None
-            elif not res_config.get("infra") and zone:
+            elif not override_res.get("infra") and zone:
                 # zone without cluster — fold into infra to avoid the
                 # "cannot specify both infra and zone" error in sky.Resources
                 infra = f"{infra}/{zone}" if infra else zone
                 zone = None
+
+            # Normalized target cloud: the first infra segment, lowercased — the
+            # single source of truth for cloud-specific resource handling (the
+            # slurm/lsf memory skip in the floor below, and autostop later). Using
+            # the resolved infra matches what SkyPilot actually provisions for
+            # `infra: "slurm/..."`, an explicit `resources.cloud`, or non-canonical
+            # casing — not just the env's default_cloud.
+            cloud_group = (str(infra).split("/", 1)[0] or "").lower()
+
+            # Build sky.Resources — merge order is precedence (last wins). The
+            # step's config.compute_config (num_cpus_per_node/total_memory_per_node)
+            # is the lowest-precedence floor; override_res wins. GPUs/accelerators
+            # are not sourced from compute_config — they flow via override_res.
+            res_config = {
+                **self._resources_from_compute_config(
+                    compute_config, cloud=cloud_group
+                ),
+                # override_res is passed VERBATIM to sky.Resources. On cloud
+                # catalogs (aws/gcp/azure/k8s) an explicit resources.cpus/memory
+                # must therefore use the "N+" minimum form (e.g. cpus: "3+"); a
+                # bare int is an EXACT request no catalog satisfies ("Catalog does
+                # not contain any instances satisfying ..."). The compute_config
+                # floor above converts for you, but this free-form passthrough of
+                # SkyPilot's own resources spec does not. (slurm/lsf match CPUs
+                # directly, so a bare int is fine there.)
+                **override_res,
+            }
 
             # Build cluster config overrides (docker run_options, etc.)
             # SkyPilot's top-level `config:` section maps to
@@ -592,9 +972,13 @@ class Skypilot(Environment):
             if docker_config:
                 cluster_config_overrides["docker"] = docker_config
 
-            image_id = config.get("launcher_config", {}).get(
-                "image_id"
-            ) or launcher_config.get("image_id")
+            # Trailing `or None` maps an empty image_id to None: the merged
+            # `command` step renders image_id to "" when no image is given, and
+            # sky.Resources expects None (bare node) rather than an empty string.
+            image_id = (
+                config.get("launcher_config", {}).get("image_id")
+                or launcher_config.get("image_id")
+            ) or None
 
             logger.info(
                 "SkyPilot resources: accelerators=%s, image_id=%s, "
@@ -685,13 +1069,39 @@ class Skypilot(Environment):
                     len(pending_hfpulls),
                 )
 
-            run_script = launcher_config.get("run", "")
-            if build_workdir:
-                run_script = (
-                    'mkdir -p "$GB_BUILD_WORKDIR"\n'
-                    'cd "$GB_BUILD_WORKDIR"\n'
-                    f"{run_script}"
+            # Compute file_mounts up front so relative destinations can be
+            # remapped into $GB_BUILD_WORKDIR (an absolute path on the shared
+            # filesystem) before the task is built. On LSF/enroot that shared
+            # tree is bind-mounted identity into the step container, so the
+            # payload written on the login node is visible to the job at the same
+            # path; the fork's backend wrap-exemption keeps these shared-root
+            # destinations un-wrapped. Relative local sources resolve against
+            # targetsteprun_asset_dir (the dir holding the rendered step.yaml +
+            # siblings). See _build_skypilot_mounts / _resolve_local_mount_source.
+            file_mounts_raw = launcher_config.get("file_mounts") or config.get(
+                "file_mounts"
+            )
+            file_mounts: Dict[str, str] = {}
+            storage_mounts: Dict[str, Any] = {}
+            if file_mounts_raw:
+                file_mounts, storage_mounts = _build_skypilot_mounts(
+                    file_mounts_raw,
+                    targetsteprun_asset_dir,
+                    build_workdir,
                 )
+
+            # The prefix always leads with `set -eu` (fail fast). When a per-run
+            # workdir was provisioned, it also prepends a `cd` into it to both
+            # setup and run so step scripts start in a known directory and can use
+            # relative paths without referencing $GB_BUILD_WORKDIR. With no
+            # shared_workdir, _get_cli_prefix emits only `set -eu` (no cd), so the
+            # scripts stay in SkyPilot's default ~/sky_workdir, where relative
+            # file_mounts land. Only prefix setup when there is a setup script, so
+            # steps without one don't acquire a spurious setup phase.
+            cli_prefix = _get_cli_prefix(build_workdir)
+            run_script = cli_prefix + launcher_config.get("run", "")
+            if setup_script:
+                setup_script = cli_prefix + setup_script
 
             # Build sky.Task
             task = sky.Task(
@@ -702,39 +1112,12 @@ class Skypilot(Environment):
                 resources=resources,
             )
 
-            # Handle file_mounts (may be in launcher config or step config)
-            # Dict values → sky.Storage (set_storage_mounts), strings → set_file_mounts
-            file_mounts_raw = launcher_config.get("file_mounts") or config.get(
-                "file_mounts"
-            )
-            if file_mounts_raw:
-                file_mounts = {}
-                storage_mounts = {}
-                for mount_path, mount_val in file_mounts_raw.items():
-                    if isinstance(mount_val, dict):
-                        mode_str = mount_val.get("mode", "MOUNT").upper()
-                        source = mount_val["source"]
-                        storage_kwargs: Dict[str, Any] = {
-                            "mode": sky.StorageMode[mode_str],
-                        }
-                        # MOUNT mode requires bucket-only source; extract
-                        # sub-path for URIs like s3://bucket/prefix
-                        parsed = urllib.parse.urlparse(source)
-                        sub_path = parsed.path.lstrip("/")
-                        if sub_path:
-                            storage_kwargs["source"] = (
-                                f"{parsed.scheme}://{parsed.netloc}"
-                            )
-                            storage_kwargs["_bucket_sub_path"] = sub_path
-                        else:
-                            storage_kwargs["source"] = source
-                        storage_mounts[mount_path] = sky.Storage(**storage_kwargs)
-                    else:
-                        file_mounts[mount_path] = mount_val
-                if file_mounts:
-                    task.set_file_mounts(file_mounts)
-                if storage_mounts:
-                    task.set_storage_mounts(storage_mounts)
+            # Attach the file/storage mounts computed above (may originate in the
+            # launcher config or the step config).
+            if file_mounts:
+                task.set_file_mounts(file_mounts)
+            if storage_mounts:
+                task.set_storage_mounts(storage_mounts)
 
             logger.info(
                 "Launching SkyPilot cluster: name=%s target=%s step=%s cloud=%s resources=%s",
@@ -748,10 +1131,9 @@ class Skypilot(Environment):
             # SLURM and LSF do not support autostop; passing any non-None
             # value (including 0) fails provisioning. Per-step `sky down`
             # cleanup handles teardown anyway, so force None on these
-            # backends regardless of the user's config.
-            cloud_for_infra = (str(infra).split("/", 1)[0] or "").lower()
-            no_autostop_clouds = ("slurm", "lsf")
-            autostop = None if cloud_for_infra in no_autostop_clouds else idle_minutes
+            # backends regardless of the user's config. Reuses cloud_group
+            # (normalized first infra segment) computed above.
+            autostop = None if cloud_group in _SSH_HPC_CLOUDS else idle_minutes
 
             # Launch and wait for provisioning, retrying transient
             # resource-acquisition failures (e.g. a just-torn-down slurm/lsf
@@ -1063,21 +1445,23 @@ class Skypilot(Environment):
         if not cluster_name:
             logger.error("No cluster_name for launch_id %s", launch_id)
             return
-
         stop_event = self._get_launch_stopped_event(launch_id)
         # Canonical key across step.yaml configs is ``poll_interval_seconds``;
         # accept the legacy ``poll_interval`` for back-compat. Templated configs
         # may render this as a string (e.g. "120"), so coerce to a number.
         _raw_poll = kwargs.get(
-            "poll_interval_seconds", kwargs.get("poll_interval", 900)
+            "poll_interval_seconds",
+            kwargs.get("poll_interval", _DEFAULT_POLL_INTERVAL_SECONDS),
         )
         try:
             poll_interval = float(_raw_poll)
         except (TypeError, ValueError):
             logger.warning(
-                "Invalid poll_interval_seconds %r; falling back to 900s", _raw_poll
+                "Invalid poll_interval_seconds %r; falling back to %d",
+                _raw_poll,
+                _DEFAULT_POLL_INTERVAL_SECONDS,
             )
-            poll_interval = 900.0
+            poll_interval = _DEFAULT_POLL_INTERVAL_SECONDS
         # Per-step log-retrieval policy (mode + cadence). Defaults to
         # on_completion: pull the full log once at terminal status.
         log_mode, log_interval, startup_window = _parse_log_retrieval(
@@ -1822,11 +2206,7 @@ class Skypilot(Environment):
             assetstore, Hfstore
         ), f"invalid assetstore: {type(assetstore).__name__} (expected 'Hfstore')"
 
-        if storeload_config is not None and storeload_config.mode not in (
-            None,
-            "hf_pull",
-        ):
-            raise ValueError(f"unsupported storeload mode: {storeload_config.mode}")
+        self._warn_non_default_mode(storeload_config, uri)
 
         hfuri = uri if isinstance(uri, HfURI) else HfURI.parse(uri)  # type: ignore[arg-type]
         shared_workdir = (
@@ -1897,55 +2277,6 @@ class Skypilot(Environment):
         )
         return binding_config, pull_step_config
 
-    async def pullasset_envstore(
-        self: Self,
-        uri: Optional[Union[str, URI]] = None,
-        binding: Optional[Any] = None,
-        storeload_config=None,
-        **kwargs,
-    ) -> Tuple[Dict, Optional[Any]]:
-        """Pull asset for env:// store — artifact is already on shared FS.
-
-        No-op pull: the path is directly accessible on the shared filesystem.
-        Returns the binding with the path extracted from the URI.
-        """
-        path = str(uri).replace("env://", "") if uri else ""
-        logger.info(
-            "pullasset_envstore: artifact at path=%s (shared FS, no transfer needed)",
-            path,
-        )
-        binding_config = {"binding": {"path": path}}
-        return binding_config, None
-
-    async def pushasset_envstore(
-        self: Self,
-        binding: Any,
-        binding_id: Optional[str] = "",
-        storepush_config=None,
-        uri: Optional[Union[str, URI]] = None,
-        assetstore=None,
-        secrets: Optional[Dict[str, str]] = None,
-        run_metadata: Optional[Any] = None,
-        output_config: Optional[Any] = None,
-    ) -> URI:
-        """Push asset for env:// store — artifact is already on shared FS.
-
-        No-op push: the artifact path from the container is directly
-        accessible on the shared filesystem, so no transfer is needed.
-        """
-        if not uri:
-            raise ValueError(
-                f"pushasset_envstore: empty uri for binding={binding_id!r}; "
-                "an env:// store push requires a concrete artifact path."
-            )
-        logger.info(
-            "pushasset_envstore: registering artifact %s at uri=%s binding=%s",
-            binding_id,
-            uri,
-            binding,
-        )
-        return URI.get_uri(str(uri))
-
     async def pushasset_hfstore(
         self: Self,
         binding: Any,
@@ -1965,6 +2296,7 @@ class Skypilot(Environment):
         from gbcommon.uri.hf import HfURI
         from gbserver.asset.hfstore import Hfstore
 
+        self._warn_non_default_mode(storepush_config, uri)
         if uri is None or uri == "":
             raise ValueError(f"Empty uri received to pushasset {binding}")
         hfuri = uri if isinstance(uri, HfURI) else HfURI.parse(uri)  # type: ignore[arg-type]
@@ -1994,10 +2326,14 @@ class Skypilot(Environment):
         if hf_resource_group_id:
             resource_group_id: Optional[str] = hf_resource_group_id
         else:
-            resource_group_id = hfuri.resolve_resource_group_id(
+            # Table-first resolution (cached id on the space row) with HF API
+            # fallback + write-back. HfURI still only receives the resolved id.
+            resource_group_id = resolve_space_resource_group_id(
+                space_name=space_name,
+                organization=hfuri.get_owner(),
                 token=assetstore.resolve_token(hfuri),
                 resource_group_name=hf_resource_group_name,
-                space_name=space_name,
+                host=hfuri.get_host(),
             )
 
         hfpush_config = Hfstore.build_hfpush_step_config(
@@ -2060,6 +2396,7 @@ class Skypilot(Environment):
         from gbcommon.uri.cos import CosURI
         from gbserver.asset.asset import Asset
 
+        self._warn_non_default_mode(storepush_config, uri)
         if uri is None or uri == "":
             raise ValueError(f"Empty uri received for pushasset: {binding}")
 

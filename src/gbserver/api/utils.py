@@ -15,14 +15,57 @@
 # limitations under the License.
 
 
-from typing import Any, Optional
+from contextlib import contextmanager
+from typing import Iterator, Optional
 
 from fastapi import HTTPException, Request, status
 from pydantic import BaseModel
 
-from gbserver.spaces.user_spaces_list import space_admin_check
+from gbserver.spaces.user_spaces_list import space_access_check, space_admin_check
 from gbserver.storage.storage import Pagination, QueryControl, SortOrder, TaggedItem
 from gbserver.types.constants import PUBLIC_SPACE_NAME, SYSTEM_TAG_PREFIX
+from gbserver.utils.remote_files_ops import (
+    RemoteFileBadRequest,
+    RemoteFileError,
+    RemoteFileNotFound,
+    RemoteFileOpFailed,
+)
+
+# Maps each remote-file domain error to the HTTP status the API surfaces for it.
+# The remote_files_ops module is framework-free (raises these instead of
+# fastapi.HTTPException); this is the single place that layer boundary is
+# translated back into HTTP. Subclasses resolve to their nearest listed base.
+_REMOTE_FILE_ERROR_STATUS = {
+    RemoteFileBadRequest: status.HTTP_400_BAD_REQUEST,
+    RemoteFileNotFound: status.HTTP_404_NOT_FOUND,
+    RemoteFileOpFailed: status.HTTP_500_INTERNAL_SERVER_ERROR,
+}
+
+
+@contextmanager
+def translate_remote_file_errors() -> Iterator[None]:
+    """Translate ``RemoteFileError`` domain errors into ``HTTPException``.
+
+    Wrap the file-op delegate calls (``run_search``/``run_list``/``peek_file``/
+    ``remote_stat``/``validate_peek_args``/…) in the ``api/`` file handlers
+    with this so the shared, framework-free ``remote_files_ops`` module can
+    signal failures without importing fastapi. The error's message is passed
+    through verbatim as the HTTP detail (the module keeps those generic, so no
+    path/identity leaks). An unrecognized ``RemoteFileError`` subclass maps to
+    500 rather than escaping untranslated.
+    """
+    try:
+        yield
+    except RemoteFileError as e:
+        status_code = next(
+            (
+                code
+                for cls, code in _REMOTE_FILE_ERROR_STATUS.items()
+                if isinstance(e, cls)
+            ),
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+        raise HTTPException(status_code, str(e)) from e
 
 
 def get_row_filter(**kwargs):
@@ -101,6 +144,56 @@ def confirm_space_write_access(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=f"User {user_id} does not have write access to item in space {space_name}",
+        )
+
+
+def has_space_member_access(
+    request: Request, username_on_target: str, space_name: str
+) -> tuple[bool, str]:
+    """See if the requesting user has at least read/member access to an asset
+    owned/created by the given username in the given space. Broader than
+    has_space_write_access: grants access to any member of the space, not
+    just the owner or a space/super admin.
+
+    Raises:
+        HTTPException: if user id is not found in the request.
+
+    Returns:
+        tuple[bool,str]: first element indicates if the requester has access and the 2nd is the user_id found in the request.
+    """
+    user_id = request.state.data["user"].login
+    if user_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Can not determine user id!"
+        )
+    is_owner = username_on_target == user_id
+    if is_owner:
+        return True, user_id
+    username_email = request.state.data["user"].email
+    has_access = is_super_admin(request) or space_access_check(
+        username_email, space_name
+    )
+    return has_access, user_id
+
+
+def confirm_space_member_access(
+    request: Request, username_on_target: str, space_name: str
+) -> None:
+    """See if the requesting user has at least read/member access to an asset
+    owned/created by the given username in the given space and raise an HTTP
+    exception if not.
+
+    Raises:
+        HTTPException: if user id is not found in the request.
+        HTTPException: if the requesting user is not a member of the space.
+    """
+    has_access, user_id = has_space_member_access(
+        request, username_on_target=username_on_target, space_name=space_name
+    )
+    if not has_access:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"User {user_id} does not have access to item in space {space_name}",
         )
 
 

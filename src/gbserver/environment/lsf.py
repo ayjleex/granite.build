@@ -19,6 +19,7 @@ LSF based environments.
 """
 
 import asyncio
+import contextlib
 import os
 import random
 import re
@@ -31,7 +32,6 @@ from pydantic import BaseModel
 
 from gbcommon.types.testing import get_exported_gbtest_env_vars
 from gbcommon.uri.cos import CosURI
-from gbcommon.uri.env import EnvURI
 from gbcommon.uri.hf import HfURI
 from gbcommon.uri.lh import LhURI
 from gbcommon.uri.space import SpaceURI
@@ -51,6 +51,7 @@ from gbserver.monitoring.lsf_bsub_monitor import LSFBsubMonitor
 from gbserver.monitoring.streams.log_stream_base import LogStreamSource
 from gbserver.monitoring.streams.stream_factory import make_stream
 from gbserver.resilience.strategies.aspera_failure import AsperaRetryStrategy
+from gbserver.spaces.resource_group import resolve_space_resource_group_id
 from gbserver.types.buildconfig import BuildTargetOutputConfig, BuildTargetStepConfig
 from gbserver.types.buildevent import (
     EntityRunMetadata,
@@ -58,6 +59,7 @@ from gbserver.types.buildevent import (
 from gbserver.types.constants import (
     DEFAULT_ROOT_WORKSPACE_DIR,
     ENABLE_SSH_HOST_KEY_VERIFICATION,
+    GBSERVER_LSF_RETRY_ADJUDICATION_TIMEOUT,
     LSF_USE_ASPERA,
     STEP_FILE_NAME,
 )
@@ -67,6 +69,7 @@ from gbserver.types.environmentconfig import (
     StoreLoad,
     StorePush,
 )
+from gbserver.types.errors import WorkloadFailedException
 from gbserver.types.stepconfig import StepConfig
 from gbserver.utils.filesystem import sync_or_copy
 from gbserver.utils.launch import (
@@ -94,23 +97,6 @@ HFPUSH_STEP_NAME = "hfpush"
 LHPULL_STEP_NAME = "lhpull"
 LHPUSH_STEP_NAME = "lhpush"
 COSRCLONE_STEP_NAME = "cosrclone"
-
-
-class BJobRecord(BaseModel):
-    """A bjob record."""
-
-    JOBID: str
-    STAT: str
-    EXIT_CODE: str
-    EXIT_REASON: str
-
-
-class BJobOutput(BaseModel):
-    """Output of bjob."""
-
-    COMMAND: str
-    JOBS: int
-    RECORDS: list[BJobRecord]
 
 
 class ExistingBsubJobs(BaseModel):
@@ -295,8 +281,15 @@ class Lsf(Environment):
                 cleanup_error,
             )
 
-        # Clear the stop event so the next monitor loop iteration starts fresh.
-        self._get_launch_stopped_event(launch_id).clear()
+        # NOTE: The stop event is intentionally left SET here. bkill above only
+        # returns once the kill request is accepted; LSF reflects the resulting
+        # EXIT state in `bjobs` several seconds later. If we cleared the event
+        # now, the still-running previous monitor iteration could observe that
+        # delayed bkill-induced EXIT with the event already cleared, defeating
+        # the clean-exit guard in LSFBsubMonitor.monitor() and misreporting the
+        # bkill as a genuine terminal failure. The event is cleared instead at
+        # the top of the next monitor_bsub_monitor loop iteration, once the
+        # previous monitors have fully wound down.
 
         try:
             task = self.launch_bsub(launch_id, **original_kwargs)
@@ -892,6 +885,13 @@ class Lsf(Environment):
                     stop_event = self._get_launch_stopped_event(
                         launch_id=current_launch_id
                     )
+                    # Reset the shared stop event for this fresh iteration. On a
+                    # retry, retry_workload leaves the event SET (so the previous
+                    # iteration's monitors treat the bkill-induced EXIT as a clean
+                    # stop); we clear it here, only after those monitors have fully
+                    # wound down, so the new monitors below start unstopped. On the
+                    # first iteration this is a harmless no-op.
+                    stop_event.clear()
                     job_id = self._launched_jobs[current_launch_id]
                     log_file_path = self.get_log_path(launch_id=current_launch_id)
 
@@ -954,14 +954,94 @@ class Lsf(Environment):
                         # triggered retry_workload which set this event. Loop for the
                         # next iteration with the same launch_id.
                         continue
+                    if await self._retry_pending_after_monitor(
+                        lsf_bsub_monitor=lsf_bsub_monitor,
+                        retry_complete_event=retry_complete_event,
+                        handler_task=_handler_task,
+                    ):
+                        # A relaunch the RetryHandler owns landed while we waited;
+                        # loop to monitor the freshly launched job.
+                        continue
+                    if (
+                        lsf_bsub_monitor.emitted_error_event
+                        and _handler_task is not None
+                    ):
+                        # The RetryHandler finished without relaunching (gave up /
+                        # retries exhausted). Stop looping; _with_retry_handler's
+                        # __aexit__ awaits the handler task and re-raises its
+                        # WorkloadFailedException, failing the step.
+                        return
                     logger.info(
                         "LSF bsub monitoring finished for job_id %s launch_id %s",
                         job_id,
                         current_launch_id,
                     )
-                    return  # Success
+                    return  # clean terminal DONE
             finally:
                 self._lsf_retry_complete_events.pop(launch_id, None)
+
+    async def _retry_pending_after_monitor(
+        self: Self,
+        lsf_bsub_monitor: LSFBsubMonitor,
+        retry_complete_event: asyncio.Event,
+        handler_task: Optional[asyncio.Task],
+    ) -> bool:
+        """Wait for the RetryHandler to adjudicate an error the monitor emitted.
+
+        On a transient/terminal error, ``LSFBsubMonitor`` only *enqueues* an event
+        and returns; the ``RetryHandler`` consumes it on its own task and, seconds
+        later (after ``bkill`` + ``bsub``), sets ``retry_complete_event``. Reading
+        that event synchronously right after ``gather`` races the handler and can
+        return SUCCESS while a relaunch is still in flight — orphaning the new job
+        and dropping its ARTIFACT_PUSHED marker. This blocks on the outcome instead.
+
+        The wait is bounded by ``GBSERVER_LSF_RETRY_ADJUDICATION_TIMEOUT`` as a
+        backstop. The handler normally relaunches or raises well within one retry,
+        and it now treats a retriable-but-exhausted error as terminal (so it
+        always resolves). The timeout only guards a pathological case the handler
+        neither retries nor recognizes as terminal; on expiry we fail the step
+        loudly rather than hang forever or silently succeed.
+
+        :param lsf_bsub_monitor: The monitor that just finished this iteration.
+        :param retry_complete_event: Event the handler sets once it has relaunched.
+        :param handler_task: The RetryHandler task, or ``None`` when retries are
+            disabled (no adjudication to wait for).
+        :returns: ``True`` if a relaunch completed (caller should loop to monitor
+            the new job); ``False`` if there is nothing to wait for or the handler
+            finished without relaunching.
+        :raises WorkloadFailedException: if neither a relaunch nor the handler task
+            resolves within the backstop timeout.
+        """
+        if not lsf_bsub_monitor.emitted_error_event or handler_task is None:
+            return False
+        # Wait for whichever comes first: the relaunch completing (retry_complete_event)
+        # or the handler task finishing (it gave up and will raise on await).
+        retry_waiter = asyncio.create_task(retry_complete_event.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {retry_waiter, handler_task},
+                timeout=GBSERVER_LSF_RETRY_ADJUDICATION_TIMEOUT,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            retry_waiter.cancel()
+            # Await the cancellation so the task fully unwinds before we return;
+            # otherwise a still-pending waiter can surface a noisy "Task was
+            # destroyed but it is pending" warning under some loop timings.
+            with contextlib.suppress(asyncio.CancelledError):
+                await retry_waiter
+        if not done:
+            logger.error(
+                "RetryHandler did not adjudicate the emitted error within %ss; "
+                "failing the step instead of waiting indefinitely.",
+                GBSERVER_LSF_RETRY_ADJUDICATION_TIMEOUT,
+            )
+            raise WorkloadFailedException(
+                "LSF retry adjudication timed out: the RetryHandler neither "
+                "relaunched the job nor terminated within "
+                f"{GBSERVER_LSF_RETRY_ADJUDICATION_TIMEOUT}s."
+            )
+        return retry_complete_event.is_set()
 
     def ssh_no_verification_flags(self: Self) -> List[str]:
         """Flags to disable SSH Host key verification."""
@@ -995,37 +1075,20 @@ class Lsf(Environment):
         # if event_configs:
         #     self._logfile_event_configs[launch_id] = event_configs
 
-    async def pullasset_envstore(
-        self: Self,
-        uri: URI,
-        binding: Optional[Any] = None,
-        storeload_config: Optional[StoreLoad] = None,
-        assetstore: Optional[Assetstore] = None,
-        secrets: Optional[dict] = None,
-        **kwargs,
-    ) -> Tuple[Dict, Optional[BuildTargetStepConfig]]:
-        """Load an asset from the env asset store"""
-        envuri = uri if isinstance(uri, URI) else URI.get_uri(uri)
-        assert isinstance(envuri, EnvURI), f"invalid envuri: {envuri}"
-        assert envuri.uri, f"invalid envuri: {envuri}"
-        final_binding_path = envuri.uri.path
-        assert final_binding_path, f"invalid envuri: {envuri}"
-        binding_config = {BINDING_KEY: {"path": final_binding_path}}
-        logger.info("loaded env uri: %s at binding: %s", uri, binding_config)
-        return (binding_config, None)
-
     def _resolve_builtin_step_yaml(self: Self, step_name: str) -> Path:
         """Resolve ``space://steps/<step_name>`` to the local step.yaml Path,
         routing through SpaceURI's env-class-match tier so the Lsf env-keyed
         copy at ``<builtins>/steps/lsf/<step_name>/step.yaml`` is selected.
 
-        Wrapped in :meth:`SpaceURI.with_current_env_class_name` because these
-        helpers run during pullasset/pushasset (target setup), which happens
-        before any ``TargetStep`` enters the resolver's env-aware scope. We
-        explicitly scope the env class here so resolution doesn't depend on
-        caller context.
+        Wrapped in :meth:`SpaceURI.with_current_env` because these helpers run
+        during pullasset/pushasset (target setup), which happens before any
+        ``TargetStep`` enters the resolver's env-aware scope. Scoping from
+        ``self`` supplies the full env context — class name, env-dir URI (for
+        the ancestor-walk tier) and sub-type (for the sub-type filter) — so
+        resolution exercises the same tiers as a normal step and doesn't depend
+        on caller context.
         """
-        with SpaceURI.with_current_env_class_name(self.__class__.__name__):
+        with SpaceURI.with_current_env(self):
             uri = URI.get_uri(f"space://steps/{step_name}", default_scheme="file")
         assert uri.uri is not None, f"unresolved space URI for step {step_name!r}"
         return Path(uri.uri.path) / STEP_FILE_NAME
@@ -1132,9 +1195,7 @@ class Lsf(Environment):
             assetstore, Lhstore
         ), f"invalid type assetstore: {type(assetstore).__name__} (expected 'Lhstore')"
         assert storeload_config is not None, "storeload_config is None"
-        assert (
-            storeload_config.mode == "dmf_pull"
-        ), f"Only 'dmf_pull' mode is supported for Lsf, mode: {storeload_config.mode} uri: {uri}"
+        self._warn_non_default_mode(storeload_config, uri)
         cache_path = storeload_config.config.get("cache_path", None)
         assert isinstance(cache_path, str), f"invalid cache_path: {cache_path}"
         assert cache_path != "", f"invalid cache_path: {cache_path}"
@@ -1188,6 +1249,7 @@ class Lsf(Environment):
         """
         Allow for a random folder/file to be copied from any mounted storage in the cluster to a lh bucket
         """
+        self._warn_non_default_mode(storepush_config, uri)
         if uri is None or uri == "":
             raise ValueError(f"Empty uri received to pushasset {binding}")
         lhuri = uri if isinstance(uri, URI) else URI.get_uri(uri)
@@ -1257,21 +1319,20 @@ class Lsf(Environment):
         Args:
             uri: HF URI to pull (e.g. hf://models/org/repo).
             binding: Unused for hfpull.
-            storeload_config: Must have mode 'hf_pull' and config with 'cache_path'.
+            storeload_config: config with 'cache_path'; mode must be unset or 'default'.
             assetstore: Hfstore instance.
             secrets: Optional secrets dict.
         Returns:
             Tuple of (binding_config, BuildTargetStepConfig).
         Raises:
-            AssertionError: If assetstore type or mode is invalid.
+            AssertionError: If assetstore type is invalid.
+            ValueError: If storeload_config declares a non-'default' mode.
         """
         assert isinstance(
             assetstore, Hfstore
         ), f"invalid type assetstore: {type(assetstore).__name__} (expected 'Hfstore')"
         assert storeload_config is not None, "storeload_config is None"
-        assert (
-            storeload_config.mode == "hf_pull"
-        ), f"Only 'hf_pull' mode is supported for Lsf, mode: {storeload_config.mode} uri: {uri}"
+        self._warn_non_default_mode(storeload_config, uri)
         cache_path = storeload_config.config.get("cache_path", None)
         assert isinstance(cache_path, str), f"invalid cache_path: {cache_path}"
         assert cache_path != "", f"invalid cache_path: {cache_path}"
@@ -1337,9 +1398,11 @@ class Lsf(Environment):
         Returns:
             BuildTargetStepConfig for the hfpush step.
         Raises:
-            ValueError: If uri is empty or the resource group cannot be resolved.
+            ValueError: If uri is empty, the resource group cannot be resolved,
+                or storepush_config declares a non-'default' mode.
             AssertionError: If binding has no 'path'.
         """
+        self._warn_non_default_mode(storepush_config, uri)
         if uri is None or uri == "":
             raise ValueError(f"Empty uri received to pushasset {binding}")
         hfuri = uri if isinstance(uri, HfURI) else HfURI.parse(uri)  # type: ignore[arg-type]
@@ -1383,10 +1446,14 @@ class Lsf(Environment):
         if hf_resource_group_id:
             resource_group_id: Optional[str] = hf_resource_group_id
         else:
-            resource_group_id = hfuri.resolve_resource_group_id(
+            # Table-first resolution (cached id on the space row) with HF API
+            # fallback + write-back. HfURI still only receives the resolved id.
+            resource_group_id = resolve_space_resource_group_id(
+                space_name=space_name,
+                organization=hfuri.get_owner(),
                 token=assetstore.resolve_token(hfuri),
                 resource_group_name=hf_resource_group_name,
-                space_name=space_name,
+                host=hfuri.get_host(),
             )
 
         hfpush_config = Hfstore.build_hfpush_step_config(
@@ -1475,9 +1542,7 @@ class Lsf(Environment):
             assetstore, Cosstore
         ), f"invalid type assetstore: {assetstore}"
         assert storeload_config is not None, "storeload_config is None"
-        assert (
-            storeload_config.mode == "cos_pull"
-        ), f"Only 'cos_pull' mode is supported for COS in LSF. Got: {storeload_config.mode}"
+        self._warn_non_default_mode(storeload_config, uri)
 
         cosuri = uri if isinstance(uri, URI) else URI.get_uri(uri)
         assert isinstance(cosuri, CosURI), f"invalid cosuri: {cosuri}"
@@ -1527,6 +1592,7 @@ class Lsf(Environment):
         """
         Copy folder/file from cluster filesystem to a COS bucket.
         """
+        self._warn_non_default_mode(storepush_config, uri)
         if uri is None or uri == "":
             raise ValueError(f"Empty uri received to pushasset {binding}")
 

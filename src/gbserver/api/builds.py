@@ -14,19 +14,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import base64
+import io
+import zipfile
 from enum import StrEnum, auto
-from typing import Annotated, List, Optional, Self, Tuple, cast
+from typing import Annotated, Dict, List, Optional, Self, Tuple, cast
 
 from fastapi import FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, model_validator
 
+from gbserver.api.build_files_paths import authorize_build_read_access
 from gbserver.api.utils import (
     ListAppendOrSet,
     apply_tag_update,
     confirm_space_write_access,
     get_query_control,
     get_row_filter,
+    has_space_write_access,
     is_space_admin,
     is_super_admin,
     split_tags,
@@ -37,7 +42,11 @@ from gbserver.storage.artifact_registration import ArtifactRegistration
 from gbserver.storage.build_storage import IStoredBuildStorage
 from gbserver.storage.singleton_storage import SingletonAdminStorage, get_admin_storage
 from gbserver.storage.space_storage import IStoredSpaceStorage
-from gbserver.storage.stored_build import StoredBuild, get_retry_chain_members
+from gbserver.storage.stored_build import (
+    StoredBuild,
+    create_continuation_build,
+    get_retry_chain_members,
+)
 from gbserver.storage.stored_event import StoredEvent
 from gbserver.storage.stored_step_run import StoredStepRun
 from gbserver.storage.stored_target_run import StoredTargetRun
@@ -45,6 +54,7 @@ from gbserver.types.api.builds import BuildValidateRequestType
 from gbserver.types.auth import User
 from gbserver.types.status import Status
 from gbserver.types.validation import GBValidationErrors
+from gbserver.utils.archive import check_zip_safe
 from gbserver.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -83,10 +93,44 @@ class BuildSubmitRequest(BaseModel):
         return self
 
 
+class BuildContinueRequest(BaseModel):
+    """
+    A build continuation request.
+
+    Continues a previously-executed build: a *fresh* build runner re-runs the
+    prior build, skipping targets that already succeeded and re-running the rest.
+    The build definition (``build_archive``), space, and targets are sourced from
+    the prior build, so only its id is required.
+
+        build_id: uuid of any member of the prior build's retry chain to continue.
+    """
+
+    build_id: str
+
+    @model_validator(mode="after")
+    def validate_build_id(self: Self) -> Self:
+        if self.build_id == "":
+            raise ValueError("build_id cannot be empty")
+        return self
+
+
 class BuildSubmitResponse(BaseModel):
     """Response to a build submission."""
 
     build_id: str
+
+
+class BuildContinueResponse(BaseModel):
+    """Response to a build continuation.
+
+    build_id: uuid of the new (continuation) build.
+    root_build_id: uuid of the chain root the continuation links to via
+        retry_of_build_id. This is resolved server-side from whichever chain
+        member was passed, so the client can report the canonical root.
+    """
+
+    build_id: str
+    root_build_id: str
 
 
 class BuildValidateRequest(BaseModel):
@@ -254,6 +298,14 @@ def submit_build(request: Request, req: BuildSubmitRequest) -> BuildSubmitRespon
     if len(sys_tags) > 0 and not is_super_admin(request):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
 
+    # req.username is the identity the build will run under and whose per-user
+    # secrets get injected into it — bind it to the caller unless the caller
+    # is a space/super admin explicitly impersonating another user, the same
+    # gate PUT /builds/{id}/update already applies to build.username.
+    confirm_space_write_access(
+        request, username_on_target=req.username, space_name=stored_space.name
+    )
+
     stored_build = StoredBuild.create(
         name=req.name,
         space_name=stored_space.name,
@@ -274,8 +326,129 @@ def submit_build(request: Request, req: BuildSubmitRequest) -> BuildSubmitRespon
     )
 
 
+@builds_api.post("/continue")
+def continue_build(
+    request: Request, req: BuildContinueRequest
+) -> BuildContinueResponse:
+    """Continue a previously-executed build in a fresh runner.
+
+    Creates a new build that extends the prior build's retry chain, so the runner
+    skips targets that already succeeded (anywhere in the chain) and re-runs the
+    rest. The prior build must be finished — continuing a build that is still
+    active (there may be a live runner) is rejected.
+    """
+    storage = get_admin_storage()
+    build_storage: IStoredBuildStorage = storage.build_storage
+    space_storage: IStoredSpaceStorage = storage.space_storage
+
+    # Every "you may not see this build" path (missing build, missing space, no
+    # write access) must return the SAME 404: otherwise a caller lacking access
+    # could tell a real build id (401) from a nonexistent one (404) and enumerate
+    # ids across spaces they cannot reach. Authorize before disclosing the build's
+    # existence or (below) its liveness.
+    not_found = HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail=f"Build {req.build_id} not found",
+    )
+    prior = build_storage.get_by_uuid(req.build_id)
+    if not isinstance(prior, StoredBuild):
+        raise not_found
+
+    # A continuation always extends the chain *tip* (the most recent attempt) and
+    # is seeded from it (space/user/build_archive), regardless of which member was
+    # passed. Resolve the chain once here — each member is an unindexed point read,
+    # so re-walking inside create_continuation_build would double the reads.
+    chain = get_retry_chain_members(build_storage, prior)
+    tip = chain[-1]
+
+    # Authorize against BOTH the passed-in build and the tip: the tip is what the
+    # continuation runs as (its space/user/secrets), so checking only `prior` while
+    # seeding from `tip` would, if members ever diverge, run under an unchecked
+    # space/user. Today every member shares these fields, so it's one real check.
+    for build in {prior.uuid: prior, tip.uuid: tip}.values():
+        stored_space = space_storage.get_by_name(build.space_name)
+        if stored_space is None:
+            raise not_found
+        has_access, _ = has_space_write_access(
+            request, username_on_target=build.username, space_name=stored_space.name
+        )
+        if not has_access:
+            raise not_found
+
+    # The "must be finished" guard applies to the tip, not the passed-in member:
+    # continuing an old finished member while a newer attempt is still active would
+    # otherwise attach a fresh runner to a live tip. There is no runner-liveness
+    # table; the build status is the signal.
+    if not tip.status.is_finished():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Build chain (latest attempt {tip.uuid}) has status {tip.status}; "
+                "only a chain whose latest attempt is finished (SUCCESS, FAILED, "
+                "INVALID, or CANCELLED) can be continued"
+            ),
+        )
+
+    try:
+        continuation = create_continuation_build(build_storage, prior, chain=chain)
+    except ValueError as e:
+        # create_continuation_build refuses to link off an untrustworthy chain
+        # (e.g. the root row became unreadable mid-request) — a consistency failure.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Build {req.build_id} cannot be continued: {e}",
+        ) from e
+    logger.info(
+        "created continuation build %s from build %s (chain root %s)",
+        continuation.uuid,
+        req.build_id,
+        continuation.retry_of_build_id,
+    )
+
+    # retry_of_build_id is the resolved chain root (set server-side regardless of
+    # which chain member was passed), so the client can report the canonical root.
+    # Guard explicitly (not via assert, which -O strips) since it feeds a required
+    # response field.
+    root_build_id = continuation.retry_of_build_id
+    if root_build_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="continuation build was created without a chain root link",
+        )
+    return BuildContinueResponse(
+        build_id=continuation.uuid,
+        root_build_id=root_build_id,
+    )
+
+
 @builds_api.post("/validate")
-def validate_build(req: BuildValidateRequest) -> JSONResponse:
+def validate_build(request: Request, req: BuildValidateRequest) -> JSONResponse:
+    # req.username drives real per-user secret resolution inside Space (see
+    # buildrunner/validation.py -> build/space.py), the same as submit_build's
+    # req.username does — bind it to the caller the same way.
+    if req.space_name:
+        storage = get_admin_storage()
+        stored_space = storage.space_storage.get_by_name(req.space_name)
+        if stored_space is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Space {req.space_name} not found in space storage",
+            )
+        confirm_space_write_access(
+            request, username_on_target=req.username, space_name=stored_space.name
+        )
+    else:
+        # space_uri bypasses space storage entirely (validate_build_archive
+        # builds a Space directly from the URI), so there is no stored space
+        # to check admin-ness against. Validating as someone else here can
+        # only be gated on being a caller-independent (super) admin.
+        user_id = request.state.data["user"].login
+        if req.username != user_id and not is_super_admin(request):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=f"User {user_id} cannot validate a build as {req.username}",
+            )
+
     errors = BuildValidation.validate_build_archive(
         build_archive=req.build_archive,
         username=req.username,
@@ -316,7 +489,7 @@ def list_build_tags(
 
 
 @builds_api.get("/{build_id}")
-def read_build(build_id: str) -> GetBuildResponse:
+def read_build(request: Request, build_id: str) -> GetBuildResponse:
     storage: SingletonAdminStorage = get_admin_storage()
     build_storage = storage.build_storage
     item = build_storage.get_by_uuid(build_id)
@@ -325,8 +498,38 @@ def read_build(build_id: str) -> GetBuildResponse:
             status_code=status.HTTP_404_NOT_FOUND, detail="build not found!"
         )
     assert isinstance(item, StoredBuild), f"invalid item: {item}"
+    authorize_build_read_access(request, item)
     resp = GetBuildResponse(build=item)
     return resp
+
+
+@builds_api.get("/{build_id}/archive")
+def get_build_archive(request: Request, build_id: str) -> Dict[str, Dict[str, str]]:
+    """Decode the build's ZIP archive and return its files as a dict.
+
+    Returns ``{"files": {"path/in/zip": "file contents", ...}}``.
+    Used by the frontend Definition tab to display build.yaml and related files.
+    """
+    storage: SingletonAdminStorage = get_admin_storage()
+    build = storage.build_storage.get_by_uuid(build_id)
+    if build is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="build not found!"
+        )
+    assert isinstance(build, StoredBuild), f"invalid item: {build}"
+    authorize_build_read_access(request, build)
+    if not build.build_archive:
+        return {"files": {}}
+    raw = base64.b64decode(build.build_archive)
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        try:
+            check_zip_safe(zf)
+        except ValueError as e:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=str(e)
+            )
+        files = {name: zf.read(name).decode(errors="replace") for name in zf.namelist()}
+    return {"files": files}
 
 
 def __get_artifacts(
@@ -380,7 +583,7 @@ def __build_target_records(
 
 @builds_api.get("/{build_id}/status", response_model=BuildStatusResponse)
 def get_build_status(
-    build_id: str, follow_retries: bool = False
+    request: Request, build_id: str, follow_retries: bool = False
 ) -> BuildStatusResponse:
     storage: SingletonAdminStorage = get_admin_storage()
     build = storage.build_storage.get_by_uuid(build_id)
@@ -389,6 +592,7 @@ def get_build_status(
             status_code=status.HTTP_404_NOT_FOUND, detail="build not found!"
         )
     assert isinstance(build, StoredBuild)
+    authorize_build_read_access(request, build)
     build.build_archive = ""
     build_status = BuildStatus(
         build=build, target_runs=__build_target_records(storage, build_id)
@@ -412,14 +616,14 @@ def get_build_status(
 
 @builds_api.get("/{build_id}/status2", response_model=BuildStatusResponse)
 def get_build_status2(
-    build_id: str, follow_retries: bool = False
+    request: Request, build_id: str, follow_retries: bool = False
 ) -> BuildStatusResponse:
     # Retained as a backward-compatible alias of the primary /status endpoint.
-    return get_build_status(build_id, follow_retries)
+    return get_build_status(request, build_id, follow_retries)
 
 
 @builds_api.get("/{build_id}/events")
-def get_buildevents(build_id: str):
+def get_buildevents(request: Request, build_id: str):
     storage: SingletonAdminStorage = get_admin_storage()
     build = storage.build_storage.get_by_uuid(build_id)
     if build is None:
@@ -427,6 +631,7 @@ def get_buildevents(build_id: str):
             status_code=status.HTTP_404_NOT_FOUND, detail="build not found!"
         )
     assert isinstance(build, StoredBuild)
+    authorize_build_read_access(request, build)
 
     row_filter = get_row_filter(build_id=build_id)
     events = cast(List[StoredEvent], storage.event_storage.get_by_where(row_filter))
@@ -572,7 +777,7 @@ class BuildUpdateResponse(BaseModel):
 def update_build(
     request: Request, build_id: str, update: BuildUpdateRequest
 ) -> BuildUpdateResponse:
-    read_resp = read_build(build_id)
+    read_resp = read_build(request, build_id)
     if read_resp is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

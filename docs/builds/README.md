@@ -105,7 +105,9 @@ targets:
 
 `evaluate` now depends on `fine-tune`; when `fine-tune.checkpoint` is produced, `evaluate` is
 dispatched with its `model` input resolved to that artifact. In step config and templates the resolved
-path is available as `{{ bindings.<name>.binding.path }}`.
+value is available as `{{ bindings.<name>.binding.path }}` for a filesystem-backed output, or
+`{{ bindings.<name>.binding.state }}` for a `mem://` output (an opaque value — e.g. a service URL —
+passed through verbatim). See the [`build.yaml` reference](build-yaml-reference.md#mem-outputs--passing-a-value-not-a-file).
 
 ## Spaces: the runtime context
 
@@ -159,6 +161,7 @@ end, try the [demos](../demos/README.md).
 
 - [Retry overview](retry.md) — how build- and step-level retry fit together.
 - [Build retry](build-retry.md) — re-run a failed build as a new attempt.
+- [Build continuation](build-continuation.md) — continue any finished build in a fresh runner, skipping succeeded targets.
 - [Step retry](step-retry-configuration.md) — re-launch a single step on a transient error.
 - [Target reuse](target-reuse.md) — skip unchanged targets across builds.
 - [Lineage tracking](lineage.md) — record build/target/artifact provenance.

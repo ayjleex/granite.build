@@ -29,6 +29,7 @@ import time
 import traceback
 from asyncio import Event, Queue
 from base64 import b64decode
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, List, Optional, Self, Union
 
@@ -50,7 +51,6 @@ from gbserver.buildrunner.buildlogger import (
     get_message_logger,
 )
 from gbserver.github.myghapi import MyGHApi
-from gbserver.lineage.jobstats import get_lineage_store
 from gbserver.metrics.metrics_client import push_metrics
 from gbserver.storage.artifact_registration import (
     ArtifactRegistration,
@@ -73,6 +73,7 @@ from gbserver.types.buildevent import (
     BuildEventType,
     BuildEventWorkloadStatusPayload,
     CreatedArtifactEventPayload,
+    StepMetadataUpdateEventPayload,
 )
 from gbserver.types.constants import (
     DEFAULT_DIR_PERMS,
@@ -145,6 +146,14 @@ class BuildRunner(AbstractBuildRunner):
         self.enable_resume = enable_resume
         self.build_run = None
         self.stop_event = threading.Event()
+        # Set by the public stop()/stop_and_fail() entrypoints to signal an
+        # explicit external termination. The start_and_wait retry loop checks this
+        # to break instead of spawning a retry. Distinct from stop_event (which is
+        # the worker-task lifecycle signal, set after every run and cleared between
+        # retries) and from __is_build_cancelled() (which only detects a CANCELLED/
+        # CANCEL_REQUESTED status): stop_and_fail marks the build FAILED, which is
+        # retryable, so without this flag a SIGTERM would spawn a retry.
+        self._stop_requested = threading.Event()
         self.build_message_logger = get_message_logger(
             build, _BUILD_EVENT_SOURCE_NAME
         )  # To be recreated later.
@@ -156,12 +165,47 @@ class BuildRunner(AbstractBuildRunner):
         # __cancel_build_run may run on the BuildWatcher thread via stop().
         self._retry_chain_build_ids: List[str] = []
         self._retry_chain_lock = threading.Lock()
+        # Serializes status transitions (__update_stored_build_status). The build
+        # runs on the worker thread while stop()/stop_and_fail() run on another
+        # thread; without this, the worker's natural finalize (e.g. a concurrent
+        # SUCCESS) can interleave with a stop-driven finalize and leave the build
+        # and its targets/steps/artifacts in disagreeing states (the build status
+        # is written unconditionally, but entity finalization only touches
+        # unfinished entities).
+        self._finalize_lock = threading.Lock()
+        # Buffers step metadata (targetsteprun_id -> {key: value}) pushed by a
+        # STEP_METADATA_UPDATE_EVENT that is processed before the status event which
+        # creates the StoredStepRun row. These come from different producers (log
+        # parsing vs. step lifecycle) with no ordering guarantee, so the value is held
+        # here and flushed onto the row once it exists (see _apply_pending_step_metadata),
+        # rather than dropped. The single serial worker loop is the only accessor, so
+        # no lock is needed.
+        self._pending_step_metadata: dict[str, dict[str, str]] = {}
 
     def stop(self: Self) -> None:
         """Stop the building thread if it was started."""
         logger.debug("BuildRunner.stop start")
+        self._stop_requested.set()
         self.__cancel_build_run()
         logger.debug("BuildRunner.stop end")
+
+    def stop_and_fail(self: Self, failure_reason: str) -> None:
+        """Stop the running build and mark it FAILED.
+
+        Public entrypoint intended to be called from another thread (e.g. a
+        SIGTERM handler) while start_and_wait() runs. Flags the run as an explicit
+        termination (so the retry loop does not treat the resulting FAILED status
+        as a retryable failure and spawn a new run) and delegates the FAILED-then-
+        cancel work to __cancel_and_fail_build (see its docstring for the ordering
+        and locking that keep the terminal status consistent).
+
+        Args:
+            failure_reason (str): reason recorded on the build for the failure.
+        """
+        logger.debug("BuildRunner.stop_and_fail start")
+        self._stop_requested.set()
+        self.__cancel_and_fail_build(failure_reason=failure_reason)
+        logger.debug("BuildRunner.stop_and_fail end")
 
     def start_and_wait(self: Self) -> None:
         """Run the inmemory build that was provided to the initializer in the current thread.
@@ -231,6 +275,17 @@ class BuildRunner(AbstractBuildRunner):
                 # CANCELLED and no further retry is created.
                 if self.__is_build_cancelled():
                     self.__cancel_build_run()
+                    break
+
+                # An explicit termination via stop()/stop_and_fail() (e.g. a
+                # SIGINT/SIGTERM handler) must not be retried. stop_and_fail marks
+                # the build FAILED — which is otherwise retryable and is NOT caught
+                # by __is_build_cancelled() above — so break here to end the chain.
+                if self._stop_requested.is_set():
+                    logger.info(
+                        "Termination requested for build %s; not retrying",
+                        self.stored_build.uuid,
+                    )
                     break
 
                 retry_build = self.__prepare_retry()
@@ -724,18 +779,34 @@ class BuildRunner(AbstractBuildRunner):
         logger.debug("BuildRunner.__worker_task end build_id: %s", build_id)
 
     def __cancel_and_fail_build(self: Self, failure_reason: str) -> None:
-        """Stop/cancel the build and mark it as failed"""
-        try:
-            self.__cancel_build_run(update_status=False)
-        except Exception as e:
-            logger.error("Could not cancel build %s", self.stored_build.uuid)
+        """Mark the build FAILED and stop its in-flight workload.
 
+        Single implementation shared by the public stop_and_fail() (external
+        SIGTERM-style termination) and the worker task's own exception path.
+
+        FAILED is committed *before* cancellation is signalled: __cancel_build_run
+        sets stop_event, after which the worker loop tries to write its own
+        CANCELLED status, so writing FAILED first lets that later write be skipped
+        by finalize_build_status's is_finished() guard. _finalize_lock (held inside
+        __update_stored_build_status) additionally serializes this against a
+        concurrent natural finalize (e.g. a SUCCESS completing at the same instant).
+
+        Args:
+            failure_reason (str): reason recorded on the build for the failure.
+        """
         try:
             self.__update_stored_build_status(
                 status=Status.FAILED, failure_reason=failure_reason
             )
-        except Exception as e:
+        except Exception:
             logger.error("Could not mark build %s as failed", self.stored_build.uuid)
+
+        try:
+            # update_status=False: FAILED is already set above; this only tears
+            # down the in-flight workload and sets stop_event.
+            self.__cancel_build_run(update_status=False)
+        except Exception:
+            logger.error("Could not stop build %s", self.stored_build.uuid)
 
     def __cancel_build_run(self: Self, update_status: bool = True) -> None:
         """Cancel the in-progress build_run and mark the whole retry chain CANCELLED.
@@ -858,6 +929,8 @@ class BuildRunner(AbstractBuildRunner):
             self.__process_workload_status_event(event=event)
         elif event.type is BuildEventType.METRICS_EVENT:
             self.__process_metrics_event(event=event)
+        elif event.type is BuildEventType.STEP_METADATA_UPDATE_EVENT:
+            self.__process_step_metadata_update_event(event=event)
         else:
             logger.error("unsupported event type: %s", event)
         logger.debug("BuildRunner.process_event end")
@@ -1214,25 +1287,21 @@ Download : {download_msg}
     ) -> None:
         """Update an existing StoredTargetRun in storage from a status event.
 
-        Sets started_at/finished_at timestamps on PENDING→RUNNING and RUNNING→* transitions,
-        merges input artifacts, updates status, and writes target_hash only on SUCCESS
-        (keeping the partial unique index invariant that only successful runs hold a hash).
+        Stamps started_at on first entry into RUNNING and finished_at on first
+        entry into a terminal status (via the shared _apply_run_timestamps),
+        merges input artifacts, updates status, and writes target_hash only on
+        SUCCESS (keeping the partial unique index invariant that only successful
+        runs hold a hash).
         """
         payload = event.payload
         assert isinstance(payload, BuildEventStatusPayload)
         logger.info("stored_target_run %s", stored_target_run)
-        if (
-            stored_target_run.status is Status.PENDING
-            and payload.status is Status.RUNNING
-        ):
-            logger.info("target started running at %s", event.timestamp)
-            stored_target_run.started_at = event.timestamp
-        if (
-            stored_target_run.status is Status.RUNNING
-            and payload.status is not Status.RUNNING
-        ):
-            logger.info("target started finished running at %s", event.timestamp)
-            stored_target_run.finished_at = event.timestamp
+        self._apply_run_timestamps(
+            stored_run=stored_target_run,
+            new_status=payload.status,
+            timestamp=event.timestamp,
+            run_label="target",
+        )
         stored_target_run.status = payload.status
         for key, item in input_artifacts.items():
             stored_target_run.input_artifacts[key] = item
@@ -1242,18 +1311,23 @@ Download : {download_msg}
         self.storage.target_storage.update(stored_target_run)
 
     def __get_retry_chain_build_ids(self: Self) -> list[str]:
-        """Return all build UUIDs in the retry chain of the current build, from the current
-        build back to the original (root) build, by following retry_of_build_id links.
+        """Return the UUIDs of *every* build in the current build's retry chain.
+
+        Uses the forward walk (``get_retry_chain_members``: resolve root via
+        ``retry_of_build_id``, then follow ``retry_build_id`` through every member)
+        so the result includes intermediate attempts, not just the current build
+        and the root. This matters because ``retry_of_build_id`` is flat-to-root
+        (every retry/continuation points at the original), so a naive backward
+        walk would yield only ``[self, root]`` and miss any member in between —
+        causing target reuse to re-run a target that first succeeded in an
+        intermediate attempt.
         """
-        build_ids = [self.stored_build.uuid]
-        current_id = self.stored_build.retry_of_build_id
-        while current_id:
-            build_ids.append(current_id)
-            ancestor = self.storage.build_storage.get_by_uuid(current_id)
-            if not isinstance(ancestor, StoredBuild):
-                break
-            current_id = ancestor.retry_of_build_id
-        return build_ids
+        return [
+            member.uuid
+            for member in get_retry_chain_members(
+                self.storage.build_storage, self.stored_build
+            )
+        ]
 
     def __is_target_already_run(
         self: Self,
@@ -1453,8 +1527,36 @@ Download : {download_msg}
         failure_reason: str = "",
         unfinished_should_update: Optional[Callable[[StoredBuild], bool]] = None,
     ) -> Optional[StoredBuild]:
-        """Update the inmemory and instorage StoredBuild with the new status, with special handling
-        for finished status value to update targets and steps in the associated build_run, if present.
+        """Update the stored build status, serialized against concurrent finalizes.
+
+        Thin wrapper holding ``_finalize_lock`` so a status transition driven from
+        another thread (stop()/stop_and_fail()) cannot interleave with the worker
+        thread's natural finalize; see ``_finalize_lock`` in __init__. Delegates to
+        ``__update_stored_build_status_locked``.
+
+        Args:
+            status (Status): the new build status.
+            failure_reason (str): applied if status is FAILED.
+            unfinished_should_update: use only for unfinished status values.
+
+        Return the updated build if the update was successful or None.
+        """
+        with self._finalize_lock:
+            return self.__update_stored_build_status_locked(
+                status, failure_reason, unfinished_should_update
+            )
+
+    def __update_stored_build_status_locked(
+        self: Self,
+        status: Status,
+        failure_reason: str = "",
+        unfinished_should_update: Optional[Callable[[StoredBuild], bool]] = None,
+    ) -> Optional[StoredBuild]:
+        """Body of __update_stored_build_status. Must be called with _finalize_lock held.
+
+        Updates the inmemory and instorage StoredBuild with the new status, with
+        special handling for a finished status value to update targets and steps in
+        the associated build_run, if present.
 
         Args:
             status (Status): _description_
@@ -1562,20 +1664,56 @@ Download : {download_msg}
             )
             self.storage.target_storage.update(stored_target_run)
         if payload.status == Status.SUCCESS:
-            # Target complete - record lineage here
-            try:
-                logger.info("create job stats for completed target %s", targetrun_id)
-                get_lineage_store().add_jobstats_for_build_target(
-                    self.storage,
-                    build_id=build_id,
-                    target_id=targetrun_id,
-                )
-            except Exception as e:
-                logger.warning(
-                    "failed to create job stats for completed build %s: %s",
-                    build_id,
-                    e,
-                )
+            # Lineage is now recorded via DB reconciliation, not from gb_events.
+            pass
+
+    @staticmethod
+    def _apply_run_timestamps(
+        stored_run: Union[StoredStepRun, StoredTargetRun],
+        new_status: Status,
+        timestamp: datetime,
+        run_label: str = "step",
+    ) -> None:
+        """Stamp started_at/finished_at on a step or target run for a transition.
+
+        Mutates ``stored_run`` in place based on its CURRENT (pre-transition)
+        status and the incoming ``new_status``; the caller updates
+        ``stored_run.status`` afterward. Shared by the step-run and target-run
+        status handlers so both obey identical transition rules.
+
+        started_at is stamped on the FIRST entry into RUNNING, regardless of the
+        prior status. Keying off "was PENDING" would drop started_at on a
+        non-linear first transition -- e.g. a target run created SUBMITTED (with
+        started_at still None) that goes straight to RUNNING. The
+        started_at-is-None guard alone provides the "first entry" semantics: a run
+        can legitimately re-enter RUNNING (the Lsf monitor reports PENDING while a
+        bsub job is queued or suspended, then RUNNING again once LSF dispatches or
+        resumes it), and the guard keeps that from pushing started_at later than
+        the run actually began.
+
+        finished_at is stamped on the FIRST entry into any terminal status
+        (``Status.is_finished()``), regardless of the prior status. Keying off
+        "was RUNNING" was wrong in both directions: a RUNNING -> PENDING transition
+        (a queued or suspended scheduler job) must NOT be marked finished, and a
+        run that terminates straight from a PENDING-mapped state must still be
+        marked finished -- e.g. the Lsf monitor reports PENDING for a suspended job
+        (PSUSP/SSUSP/USUSP/UNKWN), the job is then killed while suspended, and the
+        terminal FAILED arrives from PENDING rather than RUNNING. The
+        finished_at-is-None guard keeps a redelivered terminal event from
+        overwriting the original timestamp.
+
+        :param stored_run: The step or target run to mutate; its ``status`` field
+            still holds the pre-transition status.
+        :param new_status: The status arriving with this event.
+        :param timestamp: The event timestamp to record.
+        :param run_label: Noun used in log lines ("step" or "target").
+        """
+        if new_status is Status.RUNNING and stored_run.started_at is None:
+            logger.info("%s started running at %s", run_label, timestamp)
+            stored_run.started_at = timestamp
+        elif new_status.is_finished() and stored_run.finished_at is None:
+            logger.info("%s finished running at %s", run_label, timestamp)
+            stored_run.finished_at = timestamp
 
     def __process_build_target_step_info_type_event(self: Self, event: BuildEvent):
         logger.info("run_info is a TargetStep")
@@ -1617,18 +1755,12 @@ Download : {download_msg}
                 status_msg=payload.msg,
                 started_at=event.timestamp,
             )
-        if (
-            stored_step_run.status is Status.PENDING
-            and payload.status is Status.RUNNING
-        ):
-            logger.info("step started running at %s", event.timestamp)
-            stored_step_run.started_at = event.timestamp
-        elif (
-            stored_step_run.status is Status.RUNNING
-            and payload.status is not Status.RUNNING
-        ):
-            logger.info("step started finished running at %s", event.timestamp)
-            stored_step_run.finished_at = event.timestamp
+        self._apply_run_timestamps(
+            stored_run=stored_step_run,
+            new_status=payload.status,
+            timestamp=event.timestamp,
+            run_label="step",
+        )
         stored_step_run.status = payload.status
         stored_step_run.status_msg = payload.msg
         logger.info("stored_step_run %s", stored_step_run)
@@ -1636,4 +1768,69 @@ Download : {download_msg}
             stored_step_run.uuid == targetsteprun_id
         ), f"expected {targetsteprun_id} actual {stored_step_run.uuid}"
         logger.info("creating/updating the step: %s", stored_step_run)
+        # Merge any step metadata buffered before this row existed (a log-parsed
+        # STEP_METADATA_UPDATE_EVENT can race ahead of this status event) so the
+        # single update below persists status and metadata together, rather than
+        # re-fetching and writing a second time. The buffer is cleared only after
+        # the write succeeds.
+        pending_metadata = self._pending_step_metadata.get(targetsteprun_id)
+        if pending_metadata:
+            stored_step_run.metadata.update(pending_metadata)
         self.storage.step_storage.update(stored_step_run)
+        if pending_metadata:
+            del self._pending_step_metadata[targetsteprun_id]
+
+    def __process_step_metadata_update_event(self: Self, event: BuildEvent) -> None:
+        """Buffer a runtime key/value and merge it into the step's metadata.
+
+        Correlates via event.run_metadata.targetsteprun_id. The value is recorded in
+        _pending_step_metadata first, then flushed onto StoredStepRun.metadata by
+        _apply_pending_step_metadata. If the row does not exist yet (this log-parsed
+        event was processed before the status event that creates it), the value stays
+        buffered and is flushed when the step status handler creates the row, so
+        metadata is never lost to event-ordering.
+
+        An event with no targetsteprun_id to correlate against — e.g. a stray marker
+        in non-step output, or an uncorrelated monitor context — is dropped with a
+        warning rather than raising, matching the buffering path's "no-op if the row
+        isn't present" posture. A raise here would fail the whole build under
+        GBSERVER_RAISE_BUILD_EXCEPTIONS over a benign lineage marker.
+
+        :param event: a STEP_METADATA_UPDATE_EVENT carrying a
+            StepMetadataUpdateEventPayload.
+        """
+        payload = event.payload
+        assert isinstance(payload, StepMetadataUpdateEventPayload)
+        targetsteprun_id = event.run_metadata.targetsteprun_id
+        if not targetsteprun_id:
+            logger.warning(
+                "Ignoring STEP_METADATA_UPDATE_EVENT with no targetsteprun_id "
+                "(key=%s); nothing to correlate it to.",
+                payload.metadata_key,
+            )
+            return
+        self._pending_step_metadata.setdefault(targetsteprun_id, {})[
+            payload.metadata_key
+        ] = payload.metadata_value
+        self._apply_pending_step_metadata(targetsteprun_id)
+
+    def _apply_pending_step_metadata(self: Self, targetsteprun_id: str) -> None:
+        """Flush buffered step metadata onto its StoredStepRun row once it exists.
+
+        No-op while the row is absent (a metadata event arrived before the status
+        event that creates the row); the buffer is retried from here and from the step
+        status handler after row creation. On success the buffered keys are merged into
+        the row (existing keys preserved) and the buffer entry is cleared.
+
+        :param targetsteprun_id: uuid of the step run whose buffered metadata to flush.
+        """
+        pending = self._pending_step_metadata.get(targetsteprun_id)
+        if not pending:
+            return
+        stored = self.storage.step_storage.get_by_uuid(targetsteprun_id)
+        if stored is None:
+            return  # row not created yet; keep buffered for a later flush
+        assert isinstance(stored, StoredStepRun)
+        stored.metadata.update(pending)
+        self.storage.step_storage.update(stored)
+        del self._pending_step_metadata[targetsteprun_id]

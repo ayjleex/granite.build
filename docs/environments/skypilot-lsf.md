@@ -80,7 +80,12 @@ cloud, so any value set on the env or launcher has no effect. Omit it.
 ### `env_local` asset store
 
 LSF jobs write outputs directly to the shared filesystem (e.g. GPFS), so outputs are registered with
-the `env_local` no-op pull/push rather than transferred. Output URIs use the `env://` scheme.
+the no-op `env://` pull/push rather than transferred. Output URIs use the `env://` scheme.
+
+The `env://` store is registered implicitly for **every** environment, so no `assetstores` entry is
+needed for it — `env://` inputs/outputs work out of the box. Add an `assetstores` block only to
+configure other schemes (e.g. `hf`) or to pin a specific `env://` `load`/`push` `mode`. See
+[Asset stores](../asset-stores/README.md#store-types-and-uri-schemes).
 
 ## Example `environment.yaml` (LSF)
 
@@ -90,14 +95,6 @@ type: Skypilot
 config:
   default_cloud: lsf
   # autostop is intentionally omitted — gbserver forces autostop=None for the lsf cloud.
-assetstores:
-  - store_uri: space://assetstores/env-local
-    load:
-      - mode: env_local
-        config: {}
-    push:
-      - mode: env_local
-        config: {}
 ```
 
 ## Example target (`build.yaml`) on LSF
@@ -151,6 +148,39 @@ targets:
 
 > Container images (`image_id` / `image_id` in the step config) require enroot on the LSF nodes — see
 > the `cloud_config.lsf.cluster_configs.<cluster>.enroot` block above.
+
+### `file_mounts` inside enroot containers
+
+With an image, the step's `run` executes inside an enroot container on the compute node, which has its
+own HOME (`HOME=/`) and `/tmp` — neither shared with the login node where `file_mounts` are rsynced.
+The only paths visible to **both** the login node and the containerized job are the shared network
+filesystem roots (e.g. `/proj`), which are bind-mounted **identity** into the container. gbserver
+therefore delivers container-bound mounts by writing them straight to the shared filesystem, routing by
+destination shape:
+
+- **relative** destinations are remapped to `<workdir>/<dst>` — an absolute path under the
+  per-target-run workdir on `/proj`. The payload is rsynced there directly on the (sudo-less) login node
+  and, because `/proj` is identity-mounted, the job (whose CWD is that workdir) reads it at exactly
+  `./<dst>`. No container staging or copy-back is involved. Persistent and per-target-run on the shared
+  workdir; requires `shared_workdir` on the environment.
+- **absolute** destinations under a shared, identity-mounted root (e.g. `/proj/…`) are likewise written
+  directly — the author's explicit shared-FS location, reachable at the same path in the container.
+- **`~/…`** destinations are **rejected** by the launcher (`~` is not expanded). They would land under
+  the login-node cluster home and be **invisible inside the container**, so `file_mounts` forbids them —
+  use a relative destination instead.
+
+Prefer a **relative** destination (see [file_mounts](skypilot.md#file_mounts)) — it is the simplest and
+gives per-target isolation, with the payload written onto the shared workdir for the job to read.
+
+> **Implementation note.** SkyPilot's backend normally sudo-symlink-wraps every absolute,
+> non-`~/`/non-`/tmp/` destination, which fails on the sudo-less login node and would redirect the
+> payload away from the identity-mounted path. The team SkyPilot fork exempts the shared-FS roots from
+> that wrap: `LsfContainerCommandRunner` (`sky/provision/lsf/command_runner.py`) exposes them via
+> `get_unwrapped_mount_prefixes()` (wired with `shared_fs_roots` in `instance.py`), and
+> `_execute_file_mounts` in `cloud_vm_ray_backend.py` skips the wrap for destinations under those roots.
+> gbserver's launcher (`_remap_relative_dest` in `environment/skypilot.py`) does the relative→
+> per-run-workdir remap for every backend; on shared-FS backends the remapped absolute path is what
+> makes the payload land in the per-run workdir.
 
 ## See also
 

@@ -19,12 +19,14 @@
 import importlib.util
 import json
 import os
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
+from urllib.parse import quote_plus
 
 from dotenv import load_dotenv
 
-from gbcommon.types.constants import DEFAULT_GH_DOMAIN, get_gh_api_base
+from gbcommon.types.constants import DEFAULT_GH_DOMAIN, get_gb_home_dir, get_gh_api_base
 from gbcommon.types.gbenvconfig import is_standalone
 from gbserver.types.constants_base import (
     ENV_VAR_IBMID_AUTHORIZE_URL,
@@ -164,6 +166,7 @@ ENV_VAR_SKYPILOT_PROVISION_BACKOFF_MAX = (
     ENV_VAR_PREFIX + "_SKYPILOT_PROVISION_BACKOFF_MAX"
 )
 ENV_VAR_METADATA_STORAGE = ENV_VAR_PREFIX + "_METADATA_STORAGE"
+ENV_VAR_UI_DIR = ENV_VAR_PREFIX + "_UI_DIR"
 ENV_VAR_AUTH_MODE = ENV_VAR_PREFIX + "_AUTH_MODE"
 ENV_VAR_API_KEY = ENV_VAR_PREFIX + "_API_KEY"
 ENV_VAR_API_USER = ENV_VAR_PREFIX + "_API_USER"
@@ -188,6 +191,100 @@ ENV_VAR_GBSERVER_ENABLE_SSH_HOST_KEY_VERIFICATION = (
 ENV_VAR_GBSERVER_ENABLE_STEP_RETRY = ENV_VAR_PREFIX + "_ENABLE_STEP_RETRY"
 ENV_VAR_BUILDRUNNERJOB_SLEEP_ON_END = ENV_VAR_PREFIX + "_BUILDRUNNERJOB_SLEEP_ON_END"
 ENV_VAR_BUILTIN_STEP_IMAGE = ENV_VAR_PREFIX + "_BUILTIN_STEP_IMAGE"
+
+
+def gbserver_ui_dir() -> str:
+    """Directory the compiled frontend assets are served from.
+
+    Default: static/ui/ under the gbserver package; override with GBSERVER_UI_DIR.
+    """
+    # This file lives at gbserver/types/constants.py; the package root is two levels up.
+    gbserver_pkg = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.environ.get(ENV_VAR_UI_DIR, os.path.join(gbserver_pkg, "static", "ui"))
+
+
+def analytics_backend_enabled() -> bool:
+    """Whether the gb_ui_backend analytics subsystem should run in this server.
+
+    True only when the package is installed AND enabled — explicit
+    GB_UI_ANALYTICS_ENABLED wins, else auto-detect off the presence of compiled
+    UI assets (an API-only server has no dashboard to serve analytics to, and
+    initializing its DB there would crash startup). Resolved here, off inherited
+    env and the shared UI dir, so the CLI parent and each uvicorn worker agree.
+    """
+    if importlib.util.find_spec("gb_ui_backend") is None:
+        return False
+    from gb_ui_backend.config import analytics_is_enabled
+
+    return analytics_is_enabled(os.path.isdir(gbserver_ui_dir()))
+
+
+def derive_analytics_database_url() -> Optional[str]:
+    """Best-effort default for GB_UI_DATABASE_URL, inherited from the main store's
+    own backend config instead of an independent SQLite default.
+
+    An operator who points the main store at Postgres (GBSERVER_METADATA_STORAGE=sql)
+    gets analytics pointed at that same Postgres instance automatically, rather than
+    silently falling back to a private SQLite file that may not even have a writable
+    directory to live in (the root cause of the crashloop #190 fixed defensively).
+
+    Returns None when no safe default can be derived — callers should leave
+    GB_UI_DATABASE_URL unset in that case; analytics_backend_enabled()'s gating and
+    main.py's try/except around init_analytics() keep that degrading gracefully
+    rather than crashing.
+
+    Note: the derived sql-mode URL does not carry GBSERVER_SQL_SCHEMA — the main
+    store's tables live in that schema (see sql_storage.py's _get_connection_specs()),
+    but analytics' gbd_* tables land in the connection role's default schema instead.
+    Distinct table prefixes mean this doesn't collide with the main store.
+    """
+    if GB_METADATA_STORAGE == "sql":
+        if GBSERVER_SQL_SCHEME != "postgresql":
+            # Lazy import: gbserver.utils.logger imports this module at its own top
+            # level, so importing it back at our module top would be circular.
+            from gbserver.utils.logger import get_logger
+
+            get_logger(__name__).warning(
+                "GBSERVER_SQL_SCHEME=%s has no known asyncpg equivalent — "
+                "skipping analytics database URL auto-derivation.",
+                GBSERVER_SQL_SCHEME,
+            )
+            return None
+        user = quote_plus(GBSERVER_SQL_USER)
+        password = quote_plus(GBSERVER_SQL_PASSWD)
+        return (
+            f"postgresql+asyncpg://{user}:{password}"
+            f"@{GBSERVER_SQL_HOST}:{GBSERVER_SQL_PORT}/{GBSERVER_SQL_DBNAME}"
+        )
+
+    if GB_METADATA_STORAGE == "sqlite":
+        from gb_ui_backend.config import ANALYTICS_DB_FILENAME
+
+        gb_home = get_gb_home_dir()
+        return f"sqlite+aiosqlite:///{os.path.join(gb_home, ANALYTICS_DB_FILENAME)}"
+
+    return None
+
+
+def derive_analytics_sql_connect_args() -> dict:
+    """JSON-serializable create_async_engine() connect_args for a derived
+    postgresql+asyncpg analytics URL, translating the main SQL store's TLS cert.
+
+    The main store's sync psycopg2 driver takes sslrootcert/sslmode as URL query
+    params (see sql_storage.py's _get_connection_specs()); asyncpg instead needs an
+    ssl.SSLContext passed as a connect arg, which isn't JSON-serializable and can't
+    cross the os.environ boundary to gb_ui_backend as-is. So this only ever returns
+    the cert file *path* under "sslrootcert_file" — gb_ui_backend's db_schema.py
+    builds the actual ssl.SSLContext from that path right before creating the engine.
+    """
+    from gbserver.storage.sql.cert_file import get_ssl_cert_file
+    from gbserver.utils.logger import get_logger
+
+    cert_file = get_ssl_cert_file(get_logger(__name__))
+    if cert_file is None:
+        return {}
+    return {"sslrootcert_file": cert_file}
+
 
 ENV_VAR_GBSERVER_SQL_SCHEME = ENV_VAR_PREFIX + "_SQL_SCHEME"  # postgresql, mysql, etc.
 ENV_VAR_GBSERVER_SQL_DBNAME = ENV_VAR_PREFIX + "_SQL_DBNAME"
@@ -229,9 +326,16 @@ ENV_VAR_GBSERVER_BUILD_FILES_DOWNLOAD_MAX_BYTES = (
     ENV_VAR_PREFIX + "_BUILD_FILES_DOWNLOAD_MAX_BYTES"
 )
 
-# Default: 1 GiB cap on streamed file downloads.
-BUILD_FILES_DOWNLOAD_MAX_BYTES = int(
-    os.getenv(ENV_VAR_GBSERVER_BUILD_FILES_DOWNLOAD_MAX_BYTES, str(1 * 1024**3))
+# Default: no cap on streamed file downloads. Downloads stream over SFTP in
+# bounded memory, so size poses no integrity/memory risk — but a large transfer
+# holds one of the tunnel's limited SFTP session slots (see SshTunnel
+# max_sessions) for its full duration, has no mid-stream resume (the endpoint
+# has no Range support), and may run into a fronting proxy/ingress body-time or
+# size limit. Set GBSERVER_BUILD_FILES_DOWNLOAD_MAX_BYTES to reintroduce a byte
+# ceiling (pre-flight 413) if any of those become a problem.
+_download_max = os.getenv(ENV_VAR_GBSERVER_BUILD_FILES_DOWNLOAD_MAX_BYTES)
+BUILD_FILES_DOWNLOAD_MAX_BYTES: Optional[int] = (
+    int(_download_max) if _download_max else None
 )
 
 ENV_VAR_GBSERVER_BUILD_FILES_LIST_MAX_ENTRIES = (
@@ -298,6 +402,168 @@ BUILD_FILES_STAT_BATCH_MAX = int(
     os.getenv(ENV_VAR_GBSERVER_BUILD_FILES_STAT_BATCH_MAX, "500")
 )
 
+# Environment-files REST API (GET /files/{environment}/{folder}/...). Browses a
+# named folder on the login nodes of a *supported environment*, authorized by
+# POSIX group membership. Reuses the same remote file-op machinery and caps as
+# the build-files API. SSH/login is the shared service identity resolved
+# per-request via open_lsf_tunnel (same as build-files); there is intentionally
+# no separate SSH/login config here.
+#
+# Only the caps enforced in the environment-files API *handlers* get an alias,
+# so each one can diverge from the build-files value by assigning it here:
+#   - DOWNLOAD_MAX_BYTES — download pre-flight size check
+#   - GREP_MAX_CONTEXT / PEEK_MAX_LINES — Query bounds on the endpoints
+# The other build-files caps (LIST_MAX_ENTRIES, GREP_MAX_HITS,
+# GREP_LINE_MAX_BYTES, PEEK_MAX_BYTES, STAT_BATCH_MAX) are enforced *inside* the
+# shared remote_files_ops module, which reads the BUILD_FILES_* originals
+# directly; both APIs get that one value and there is nothing here to tune. To
+# make one of those independently tunable, remote_files_ops would have to accept
+# it as a parameter instead of importing BUILD_FILES_* directly.
+ENV_FILES_DOWNLOAD_MAX_BYTES = BUILD_FILES_DOWNLOAD_MAX_BYTES
+ENV_FILES_GREP_MAX_CONTEXT = BUILD_FILES_GREP_MAX_CONTEXT
+ENV_FILES_PEEK_MAX_LINES = BUILD_FILES_PEEK_MAX_LINES
+
+# Max group members resolved per `getent passwd` round-trip when authorizing an
+# environment-files request. Members are looked up in chunks of this size so a
+# large proj_{folder} group can't build a command line that trips ARG_MAX / the
+# shell's arg limit on the login node (which would fail authz for a legitimate
+# member, surfacing as an undiagnosable uniform 404). 256 keeps each command
+# comfortably short while still batching the common case into one call.
+ENV_VAR_GBSERVER_ENV_FILES_GETENT_BATCH_MAX = (
+    ENV_VAR_PREFIX + "_ENV_FILES_GETENT_BATCH_MAX"
+)
+ENV_FILES_GETENT_BATCH_MAX = int(
+    os.getenv(ENV_VAR_GBSERVER_ENV_FILES_GETENT_BATCH_MAX, "256")
+)
+
+
+@dataclass(frozen=True)
+class EnvironmentFilesConfig:
+    """Per-environment config for the ``/files/{environment}`` API.
+
+    One record per *supported* environment. The set of records IS the set of
+    valid ``{environment}`` values — an environment absent from the registry is
+    unsupported and the API denies it with the same uniform 404 as a missing
+    folder (no leak of which environments exist).
+
+    Fields:
+      * ``gpfs_base`` — fixed base under which folders live on this
+        environment's login nodes; folder root = ``gpfs_base/{folder}``. Not
+        caller-supplied.
+      * ``space_name`` — space whose IBM Cloud Secret Manager holds the service
+        SSH key used to open the tunnel (server-resolved, never the requester).
+      * ``environment_uri`` — the asset URI pointing at the LSF
+        ``environment.yaml`` whose login nodes mount ``gpfs_base``. Registry
+        entries leave this empty: it is filled per request by
+        ``resolve_environment``, which derives it from the public space's config
+        repo (see ``get_supported_env_for_files_uri``), yielding a
+        ``git+ssh://…@<config-branch>#subdirectory=environments/<env>`` asset URI.
+        Per-deployment (dev/staging/prod) differences come "for free" from the
+        public space config, so there is no separately-set value; the endpoints
+        return 503 when the URI can't be derived (rather than guess).
+    """
+
+    gpfs_base: str
+    space_name: str
+    environment_uri: str = ""
+
+
+# Registry of supported environments for the files API. Adding a new supported
+# environment is a data change here, not new code. Today the only working
+# environment is `bluevela` (LSF login nodes mounting /proj), preserving the
+# behavior the API shipped with.
+#
+# GBSERVER_BLUEVELA_FILES_SPACE_NAME carries the module-wide GBSERVER_ prefix
+# (ENV_VAR_PREFIX) — NOT a bare GB_ prefix — and defaults to the public space
+# (literal "public"; the PUBLIC_SPACE_NAME constant is defined further down this
+# file). There is no environment-URI env var: the asset URI is always derived
+# from the public space config repo at request time (see
+# get_supported_env_for_files_uri below), so per-deployment differences come from
+# the public space config, not a separately-set value.
+ENV_VAR_GBSERVER_BLUEVELA_FILES_SPACE_NAME = (
+    ENV_VAR_PREFIX + "_BLUEVELA_FILES_SPACE_NAME"
+)
+
+# The single supported environment name for the files API. Used both as the
+# registry key and by the environment-URI derivation (the `environments/<name>`
+# subdirectory in the public space config repo). Only the value is "bluevela"
+# specific; the symbol is generic so a future supported env is a data change.
+SUPPORTED_ENV_FOR_FILES = "bluevela"
+
+ENVIRONMENT_FILES_REGISTRY: Dict[str, EnvironmentFilesConfig] = {
+    SUPPORTED_ENV_FOR_FILES: EnvironmentFilesConfig(
+        gpfs_base="/proj",
+        space_name=os.getenv(ENV_VAR_GBSERVER_BLUEVELA_FILES_SPACE_NAME, "public"),
+        # environment_uri is left empty here and filled per request by
+        # resolve_environment via get_supported_env_for_files_uri().
+    ),
+}
+
+
+# Process-level cache of the derived environment URI, keyed by public-space repo
+# URL. Only a *stable* derivation is cached (a git result with a config branch, or
+# a file:// path); a branchless git result / failures / empties are not, so a later
+# request retries once the gbspace-config branch / token is healthy. Lock-free
+# write is fine: dict assignment is atomic, worst case is a redundant re-probe.
+_DERIVED_ENV_FOR_FILES_URI_CACHE: Dict[str, str] = {}
+
+
+def get_supported_env_for_files_uri() -> str:
+    """Derive the supported environment's environment.yaml asset URI.
+
+    Converts ``PUBLIC_SPACE_GIT_URI`` (the public space config repo) into a
+    ``git+ssh://…[@<config-branch>]#subdirectory=environments/<env>`` asset URI
+    via ``GitURI.get_gb_space_config_uri`` (the same conversion the build path
+    uses) and appends the env subdirectory. There is no override; the URI is
+    always derived, so per-deployment differences come from the public space.
+
+    Returns ``""`` (→ 503 in the caller) whenever a URI can't be produced: no
+    ``PUBLIC_SPACE_GIT_URI`` (e.g. STANDALONE), or the GitHub config-branch probe
+    failing — the exception is caught so a transient GitHub problem reads as "not
+    configured", not a 500.
+
+    Lazy (not evaluated at import) to avoid a cycle: git.py imports
+    ``GBSERVER_GITHUB_TOKEN`` from this module. See the cache note above for what
+    is / isn't memoized.
+    """
+    if not PUBLIC_SPACE_GIT_URI:
+        return ""
+    cached = _DERIVED_ENV_FOR_FILES_URI_CACHE.get(PUBLIC_SPACE_GIT_URI)
+    if cached is not None:
+        return cached
+    # Function-local import: git.py imports from this module (cycle otherwise).
+    from requests import RequestException
+
+    from gbcommon.uri.git import GitURI
+    from gbcommon.uri.uri import URI
+    from gbserver.utils.logger import get_logger
+
+    try:
+        base = GitURI.get_gb_space_config_uri(PUBLIC_SPACE_GIT_URI)
+    except (ValueError, RuntimeError, RequestException) as e:
+        # is_branch_present raises ValueError (401) / RuntimeError (non-404) /
+        # requests error (network); degrade those to 503, not 500. Anything else
+        # is an unexpected bug and propagates. Not cached — retry on recovery.
+        get_logger(__name__).warning(
+            "failed to derive files-env URI from public space %r: %s",
+            PUBLIC_SPACE_GIT_URI,
+            e,
+        )
+        return ""
+    if not base:
+        return ""
+    # get_gb_space_config_uri never adds a fragment (only `@<branch>` on a match),
+    # so append_path always creates the `#subdirectory=` fragment here.
+    uri = URI.get_uri(base)
+    uri.append_path(f"environments/{SUPPORTED_ENV_FOR_FILES}")
+    resolved = str(uri)
+    # Cache only a stable result (file:// path, or git with a config branch); a
+    # branchless git URI points at the default branch and is left uncached.
+    if base.startswith("file://") or "@" in base.split("#", 1)[0]:
+        _DERIVED_ENV_FOR_FILES_URI_CACHE[PUBLIC_SPACE_GIT_URI] = resolved
+    return resolved
+
+
 ENV_VAR_GBSERVER_DEFAULT_GH_REQUEST_TIMEOUT = (
     ENV_VAR_PREFIX + "_DEFAULT_GH_REQUEST_TIMEOUT"
 )
@@ -339,8 +605,8 @@ GBSERVER_TRUNCATE_LENGTH = int(os.getenv(ENV_VAR_TRUNCATE_LENGTH, "-1"), base=10
 # Cap on simultaneous SkyPilot cluster bring-ups. Each launch opens a fresh
 # SSH session to the cloud's login node; LSF-backed clouds in particular
 # trip MaxAuthTries on sshd when many evals fan out at once. Default 4 is
-# safe for BlueVela; override to a higher value on clouds that don't
-# bottleneck on SSH (e.g. Kubernetes).
+# safe for SSH-bottlenecked clusters; override to a higher value on clouds
+# that don't bottleneck on SSH (e.g. Kubernetes).
 GBSERVER_SKYPILOT_LAUNCH_CONCURRENCY = int(
     os.getenv(ENV_VAR_SKYPILOT_LAUNCH_CONCURRENCY, "4"), base=10
 )
@@ -426,6 +692,23 @@ GITHUB_API_RETRY_BASE_DELAY = float(
 )
 GITHUB_API_RETRY_MAX_DELAY = float(
     os.getenv(ENV_VAR_PREFIX + "_GITHUB_API_RETRY_MAX_DELAY", "60.0")
+)
+# Low-level transport retry configuration. These tune the tenacity-based retries
+# injected at startup (see resilience/transport_retry.py) around aiohttp DNS
+# resolution and kubernetes_asyncio HTTP requests, so build runs survive
+# transient connection blips in our clusters. Set MAX_ATTEMPTS to 1 to disable.
+#
+# Defaults give exponential backoff capped at 15s/attempt over 10 attempts:
+# ~90s worst-case (~45s typical) total wait, close to the ~100s budget of the
+# original library patches this replaced.
+TRANSPORT_RETRY_MAX_ATTEMPTS = int(
+    os.getenv(ENV_VAR_PREFIX + "_TRANSPORT_RETRY_MAX_ATTEMPTS", "10"), base=10
+)
+TRANSPORT_RETRY_BASE_DELAY = float(
+    os.getenv(ENV_VAR_PREFIX + "_TRANSPORT_RETRY_BASE_DELAY", "1.0")
+)
+TRANSPORT_RETRY_MAX_DELAY = float(
+    os.getenv(ENV_VAR_PREFIX + "_TRANSPORT_RETRY_MAX_DELAY", "15.0")
 )
 GBSERVER_GITHUB_TOKEN = os.getenv(
     ENV_VAR_DEFAULT_GITHUB_TOKEN, os.getenv("GITHUB_TOKEN", "")
@@ -516,6 +799,19 @@ GBSERVER_LSF_TRANSIENT_ERROR_MAX_RETRIES = int(
 GBSERVER_LSF_TRANSIENT_ERROR_RETRY_DELAY = int(
     os.getenv(ENV_VAR_PREFIX + "_LSF_TRANSIENT_ERROR_RETRY_DELAY", "30"), base=10
 )
+# Backstop timeout (seconds) for Lsf._retry_pending_after_monitor's wait on the
+# RetryHandler to adjudicate an error the monitor emitted. The handler normally
+# relaunches or raises well within one retry (one backoff delay + bkill + bsub),
+# so this only bounds a pathological hang (a monitor error shape the handler
+# neither retries nor treats as terminal). Default is a generous multiple of the
+# backoff delay so a genuinely slow relaunch is never mistaken for a hang.
+GBSERVER_LSF_RETRY_ADJUDICATION_TIMEOUT = int(
+    os.getenv(
+        ENV_VAR_PREFIX + "_LSF_RETRY_ADJUDICATION_TIMEOUT",
+        str(GBSERVER_LSF_TRANSIENT_ERROR_RETRY_DELAY * 10 + 60),
+    ),
+    base=10,
+)
 # Used by the build framework monitoring to allow the consumption of all the events
 GBSERVER_MONITORING_GRACE_PERIOD = int(
     os.getenv(ENV_VAR_PREFIX + "_MONITORING_GRACE_PERIOD", "30"), base=10
@@ -603,6 +899,8 @@ GBSERVER_WANDB_ENTITY = os.getenv(ENV_VAR_PREFIX + "_WANDB_ENTITY", "dmf-testing
 GBSERVER_WANDB_BASE_URL = os.getenv(
     ENV_VAR_PREFIX + "_WANDB_BASE_URL", "https://ibm.wandb.io"
 )
+GBSERVER_WANDB_QUIET = getenv_boolean(ENV_VAR_PREFIX + "_WANDB_QUIET", True)
+GBSERVER_WANDB_LOG_LEVEL = os.getenv(ENV_VAR_PREFIX + "_WANDB_LOG_LEVEL", "warning")
 
 GBSERVER_SQL_SCHEME = os.getenv(ENV_VAR_GBSERVER_SQL_SCHEME, "postgresql")
 GBSERVER_SQL_HOST = os.getenv(
@@ -716,6 +1014,7 @@ GB_ARTIFACT_REGISTRY_TABLE_NAME = "gb_artifacts"
 GB_TARGET_RUNS_TABLE_NAME = "gb_targets"
 GB_NODE_FAILURES_TABLE_NAME = "gb_ndfail"
 GB_SPACE_USERS_TABLE_NAME = "gb_space_users"
+GB_KV_PAIRS_TABLE_NAME = "gb_kv_pairs"
 
 GB_JOB_STATS_DETAIL_CATEGORY = "granite-dot-build"
 GB_JOB_STATS_DETAIL_TYPE = "granite-dot-build"

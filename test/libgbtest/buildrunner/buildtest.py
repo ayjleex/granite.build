@@ -25,10 +25,11 @@ from datetime import timedelta
 from enum import Enum
 from pathlib import Path
 from time import sleep, time
-from typing import TYPE_CHECKING, ClassVar, List, Optional, Self, Union
+from typing import TYPE_CHECKING, Any, ClassVar, List, Optional, Self, Union
 
 import pytest
 import yaml
+from libgbtest.buildrunner.placeholder import PLACEHOLDER
 from libgbtest.buildrunner.utils import (
     ExceptionRaisingThread,
     cluster_logout,
@@ -68,8 +69,7 @@ if TYPE_CHECKING:
 
 from gbcommon.uri.git import get_uri_parts
 from gbserver.github.myghapi import MyGHApi
-from gbserver.lineage.jobstats import get_lineage_store, reset_lineage_store
-from gbserver.lineage.noop_jobstats import NoopLineageStore
+from gbserver.lineage.jobstats import reset_lineage_store
 from gbserver.storage.artifact_registration import (
     ArtifactRegistration,
     ArtifactRegistrationStatus,
@@ -87,12 +87,28 @@ from gbserver.types.constants import (
     GBSERVER_GBSERVER_IMAGE_TAG,
     GBSERVER_GITHUB_TOKEN,
     GBSERVER_SIDECAR_MONITORING_IMAGE_TAG,
+    MEM_URI_SCHEME,
 )
 from gbserver.types.status import Status
 from gbserver.utils.logger import get_logger
 from gbserver.utils.utils import get_time, get_uuid
 
 logger = get_logger(__name__)
+
+
+class ExpectedStep(BaseModel):
+    """Optional assertions checked against a target's StoredStepRun row(s)."""
+
+    step_uri: Optional[str] = None
+    """Match the step by its definition_uri; if omitted, applies to the target's
+    single step (fails if the target has more than one step)."""
+    metadata: dict[str, str] = {}
+    """Key -> exact value that must be present in StoredStepRun.metadata."""
+    metadata_matches: dict[str, str] = {}
+    """Key -> regex the StoredStepRun.metadata value must fullmatch (for
+    runtime-variable values such as a commit SHA)."""
+    config: dict[str, Any] = {}
+    """Nested subset that must be present in StoredStepRun.config."""
 
 
 class ExpectedTarget(BaseModel):
@@ -104,7 +120,36 @@ class ExpectedTarget(BaseModel):
     """Number of input artifacts to be recorded in the recorded target record."""
     output_artifact_count: int
     """Number of output artifacts to be recorded in the recorded target record."""
-    jobstats_count: int
+    jobstats_count: int = -1
+    """Expected jobstats records. Defaults to -1 (skip): jobstats are not asserted
+    at run time yet (lineage verification is a no-op under async lineage), so the
+    `gbtest render` skeleton does not force a value for it."""
+    expected_steps: list[ExpectedStep] = []
+    """Optional per-step metadata/config assertions checked against the persisted
+    StoredStepRun rows. Empty (default) means not checked, so existing fixtures are
+    unaffected."""
+
+    @field_validator(
+        "step_count",
+        "input_artifact_count",
+        "output_artifact_count",
+        mode="before",
+    )
+    @classmethod
+    def _reject_placeholder(cls, v, info):
+        """Fail loudly if a `gbtest render` skeleton placeholder was left unreplaced.
+
+        The generator emits the shared ``PLACEHOLDER`` sentinel for values it
+        cannot derive; both modules import it from
+        ``libgbtest.buildrunner.placeholder`` so the token has a single source of
+        truth.
+        """
+        if isinstance(v, str) and v.strip() == PLACEHOLDER:
+            raise ValueError(
+                f"unreplaced FIXME placeholder for '{info.field_name}': edit the "
+                f"`gbtest render` skeleton before running it"
+            )
+        return v
 
 
 class BuildTestSpecification(BaseModel):
@@ -169,7 +214,9 @@ class BuildTestSpecification(BaseModel):
         return v
 
     @classmethod
-    def from_yaml(cls, path: Path) -> "BuildTestSpecification":
+    def from_yaml(
+        cls, path: Path, build_yaml_override: Optional[str] = None
+    ) -> "BuildTestSpecification":
         """Construct a BuildTestSpecification from a YAML file.
 
         Path-typed fields are resolved relative to the YAML file's directory so a
@@ -198,7 +245,12 @@ class BuildTestSpecification(BaseModel):
         assert isinstance(data, dict), f"expected a dict, actual: {data}"
 
         yaml_dir = path.parent
-        data["build_yaml"] = _resolve_build_yaml(data.get("build_yaml"), yaml_dir)
+        if build_yaml_override is not None:
+            # An explicit `-f` override resolves against CWD (where gbtest was
+            # run), not the buildtest.yaml dir.
+            data["build_yaml"] = str(Path(build_yaml_override).resolve())
+        else:
+            data["build_yaml"] = _resolve_build_yaml(data.get("build_yaml"), yaml_dir)
         if data.get("space_uri") is not None:
             data["space_uri"] = _resolve_space_uri(data["space_uri"], yaml_dir)
         return cls.model_validate(data)
@@ -1105,14 +1157,9 @@ class AbstractBuildTest(AbstractSingletonStorageUsingPreloadedSpaceTest):
             build_id,
             f"Skipped target '{built_target.name}' should have 0 steps but has {len(step_list)}",
         )
-        count = get_lineage_store().count_release_ids(
-            release_id=built_target.build_id,
-            target_id=built_target.uuid,
-        )
-        assert count == expected.jobstats_count, self._failed_build_msg(
-            build_id,
-            f"Skipped target {built_target.name} created {count} jobstats, but expected  {expected.jobstats_count}",
-        )
+        # Lineage record count is no longer asserted: recording now happens
+        # asynchronously in the out-of-band lineage-watch process, so the count
+        # is not a synchronous product of the build. See _verify_lineage.
 
     def _verify_unskipped_target_and_steps(
         self: Self,
@@ -1151,9 +1198,15 @@ class AbstractBuildTest(AbstractSingletonStorageUsingPreloadedSpaceTest):
                     build_id,
                     f"stored artifact {uuid} is not marked as success, status is {artifact.status}",
                 )
-                assert artifact.type != ArtifactType.UNDEFINED, self._failed_build_msg(
-                    build_id, f"stored artifact {uuid} has an undefined type"
-                )
+                # mem:// artifacts carry an opaque state value (e.g. a service
+                # URL), not a typed asset, so they legitimately have no type —
+                # unlike file/hf/cos/env outputs. Skip the type check for them.
+                if not artifact.uri.startswith(f"{MEM_URI_SCHEME}://"):
+                    assert (
+                        artifact.type != ArtifactType.UNDEFINED
+                    ), self._failed_build_msg(
+                        build_id, f"stored artifact {uuid} has an undefined type"
+                    )
 
         # Verify the number of expected steps and their status values
         step_list = self.storage.step_storage.get_by_where(
@@ -1169,53 +1222,140 @@ class AbstractBuildTest(AbstractSingletonStorageUsingPreloadedSpaceTest):
             )
         self._verify_steplist_status(build_id, step_list, status_list)
 
+        self._verify_step_data(build_id, step_list, expected)
+
         self._verify_lineage(built_target, expected)
+
+    def _verify_step_data(
+        self: Self,
+        build_id: str,
+        step_list: list[StoredStepRun],
+        expected: ExpectedTarget,
+    ) -> None:
+        """Assert each ExpectedStep's metadata/config against the persisted steps.
+
+        No-op when ``expected.expected_steps`` is empty. Each ExpectedStep is
+        matched to a StoredStepRun by ``step_uri`` (its definition_uri), or to the
+        target's sole step when ``step_uri`` is omitted.
+
+        :param build_id: id of the build under test (for failure messages).
+        :param step_list: the target's persisted StoredStepRun rows.
+        :param expected: the target's expectation carrying ``expected_steps``.
+        """
+        for expected_step in expected.expected_steps:
+            step = self._resolve_expected_step(build_id, step_list, expected_step)
+            for key, value in expected_step.metadata.items():
+                assert step.metadata.get(key) == value, self._failed_build_msg(
+                    build_id,
+                    f"step {step.definition_uri} metadata[{key}]: "
+                    f"actual {step.metadata.get(key)!r} expected {value!r}",
+                )
+            for key, pattern in expected_step.metadata_matches.items():
+                actual = step.metadata.get(key, "")
+                assert re.fullmatch(pattern, actual), self._failed_build_msg(
+                    build_id,
+                    f"step {step.definition_uri} metadata[{key}]={actual!r} "
+                    f"does not match /{pattern}/",
+                )
+            self._assert_contains_subset(
+                build_id,
+                step.config,
+                expected_step.config,
+                f"step {step.definition_uri} config",
+            )
+
+    def _resolve_expected_step(
+        self: Self,
+        build_id: str,
+        step_list: list[StoredStepRun],
+        expected_step: ExpectedStep,
+    ) -> StoredStepRun:
+        """Find the StoredStepRun an ExpectedStep refers to.
+
+        Matches by ``expected_step.step_uri`` (definition_uri) when set; otherwise
+        requires the target to have exactly one step.
+
+        :param build_id: id of the build under test (for failure messages).
+        :param step_list: the target's persisted StoredStepRun rows.
+        :param expected_step: the expectation to resolve.
+        :returns: the uniquely matched StoredStepRun.
+        :raises AssertionError: if no unique match exists.
+        """
+        if expected_step.step_uri is not None:
+            matches = [
+                s for s in step_list if s.definition_uri == expected_step.step_uri
+            ]
+            assert len(matches) == 1, self._failed_build_msg(
+                build_id,
+                f"expected exactly one step with uri {expected_step.step_uri}, "
+                f"found {len(matches)}",
+            )
+            return matches[0]
+        assert len(step_list) == 1, self._failed_build_msg(
+            build_id,
+            f"expected_steps entry omits step_uri but target has "
+            f"{len(step_list)} steps",
+        )
+        return step_list[0]
+
+    def _assert_contains_subset(
+        self: Self,
+        build_id: str,
+        actual: Any,
+        expected: Any,
+        ctx: str,
+    ) -> None:
+        """Assert ``expected`` is contained in ``actual`` (recursive for dicts).
+
+        Dicts are matched key-by-key (each expected key must be present and its
+        value contained); all other values must be equal. Lets a fixture assert
+        only the config keys it cares about.
+
+        :param build_id: id of the build under test (for failure messages).
+        :param actual: the persisted value.
+        :param expected: the expected subset.
+        :param ctx: dotted path describing the location, for failure messages.
+        """
+        if isinstance(expected, dict):
+            assert isinstance(actual, dict), self._failed_build_msg(
+                build_id, f"{ctx}: expected a mapping, got {type(actual).__name__}"
+            )
+            for key, sub in expected.items():
+                assert key in actual, self._failed_build_msg(
+                    build_id, f"{ctx}: missing key {key!r}"
+                )
+                self._assert_contains_subset(build_id, actual[key], sub, f"{ctx}.{key}")
+        else:
+            assert actual == expected, self._failed_build_msg(
+                build_id, f"{ctx}: actual {actual!r} expected {expected!r}"
+            )
 
     def _verify_lineage(
         self: Self,
         built_target: StoredTargetRun,
         expected: ExpectedTarget,
     ) -> None:
-        """Verify the number of jobstats/lineage records matches the expected count.
+        """Lineage record count is no longer asserted here.
 
-        Retries a few times because Lakehouse writes from the K8s build runner
-        pod may not be immediately visible to a query in this process. Skips the
-        check entirely when no real lineage store is configured.
+        Lineage recording used to run synchronously inside the build, so the
+        record count matched right after the build. Recording is now done
+        asynchronously by the out-of-band ``lineage-watch`` process reconciling
+        the admin DB (see ``lineage_watcher`` / ``lineage_reconciler``), which is
+        not part of the build flow exercised by this test. The record count is
+        therefore no longer a synchronous product of a build, so asserting on it
+        here no longer makes sense.
+
+        The build's own persisted lineage (target input/output artifacts, steps)
+        is still verified elsewhere in this class; only the external-store record
+        count assertion is dropped.
 
         Args:
-            built_target: The stored target run whose lineage records are counted
-                (uses its ``build_id`` as the release id and ``uuid`` as the
-                target id).
-            expected: Expected-target spec providing ``jobstats_count``.
-
-        Raises:
-            AssertionError: If the observed lineage record count never matches
-                ``expected.jobstats_count`` after the retries.
+            built_target: The stored target run (unused; retained for signature
+                stability with callers).
+            expected: Expected-target spec (unused).
         """
-        if isinstance(get_lineage_store(), NoopLineageStore):
-            logger.warning("skipping lineage assertion: NoopLineageStore active")
-            return
-        count = 0
-        for attempt in range(5):
-            count = get_lineage_store().count_release_ids(
-                release_id=built_target.build_id,
-                target_id=built_target.uuid,
-            )
-            if count == expected.jobstats_count:
-                break
-            if attempt < 4:
-                logger.info(
-                    "JobStats count %d != expected %d for target %s, retrying (%d/5)...",
-                    count,
-                    expected.jobstats_count,
-                    built_target.name,
-                    attempt + 1,
-                )
-                sleep(3)
-        assert count == expected.jobstats_count, self._failed_build_msg(
-            build_id=built_target.build_id,
-            message=f"Target {built_target.name} created {count} JobStats, expected {expected.jobstats_count} ",
-        )
+        # Intentionally a no-op: see docstring.
+        return
 
     def _verify_target_status(
         self, build_id: str, target: StoredTargetRun, status_list: list[Status]
@@ -1372,7 +1512,8 @@ class AbstractYamlBuildRunnerTest(AbstractBuildRunnerTest):
         ``_get_yaml_spec_dir``.
         """
         return BuildTestSpecification.from_yaml(
-            self._get_yaml_spec_dir() / "buildtest.yaml"
+            self._get_yaml_spec_dir() / "buildtest.yaml",
+            build_yaml_override=getattr(self, "_build_yaml_override", None),
         )
 
     def _run_yaml_spec(self: Self, test_key: str, test_cancel: bool) -> None:

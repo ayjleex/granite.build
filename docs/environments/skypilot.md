@@ -68,21 +68,20 @@ config:
 
 assetstores:
   - store_uri: space://assetstores/hf
-    load:
-      - mode: hf_pull               # Queues the builtin hfpull step on its own SkyPilot cluster.
+    pull:
+      - mode: default              # Dispatch is by store type (hf) — queues the builtin hfpull step.
         config:
           cache_path: /tmp/hf_cache  # Optional. Defaults to {shared_workdir}/hf_cache when set,
                                      # else ~/.cache/gbserver/hf on the worker.
     push:
-      - mode: hf_push
-  - store_uri: space://assetstores/env-local
-    load:
-      - mode: env_local             # No-op: output already on the shared FS (bare-metal HPC).
-        config: {}
-    push:
-      - mode: env_local
-        config: {}
+      - mode: default
 ```
+
+> Outside k8s, `mode` must be unset or `default` — dispatch is by store type, not `mode`. See
+> [asset stores](../asset-stores/README.md#load-and-push-modes).
+
+> `env://` (shared-filesystem, no-op push/pull) is registered implicitly for every environment, so it
+> needs no `assetstores` entry.
 
 ### `shared_workdir`
 
@@ -91,9 +90,11 @@ admin provisions — gbserver does not create or mount it. When set, `shared_wor
 
 - is the default base for gbserver-managed caches (currently the HF asset cache);
 - is exported to every step's `run` as `GB_SHARED_WORKDIR`;
-- gets a per-target-run subdir `${shared_workdir}/builds/<build_id>/runs/<targetrun_id>/`, exported as
-  `GB_BUILD_WORKDIR` and set as the **initial CWD** of the `run` command. It is created lazily before
-  the first step and `rm -rf`'d at target-run teardown; retries get a fresh dir.
+- gets a per-target-run subdir `${shared_workdir}/builds/<build_id>/runs/<targetrun_id>/` that is the
+  **initial CWD** of both the `setup` and `run` scripts (with no `shared_workdir` both phases instead
+  share SkyPilot's default `~/sky_workdir` — either way the two phases start in the same directory). It
+  is created lazily before the first step and `rm -rf`'d at target-run teardown; retries get a fresh
+  dir.
 
 When unset, gbserver-managed caches fall back to `~/.cache/gbserver/<store>` on the worker, which only
 works when consecutive steps land on the same machine. Example paths per backend: `slurm: /shared`
@@ -120,43 +121,185 @@ environment_configs:
         type: skypilot
         monitors:
           - skypilot_monitor
-        config:
+        config:                   # This whole block is the launcher_config (see "Field reference").
           # ---- sky.Resources ----
           image_id: docker:python:3.11-slim
-                                  # Optional. Container image. On SLURM this REQUIRES the Pyxis SPANK
-                                  # plugin; omit on bare-host SLURM or the launch fails.
+                                  # Optional. Container image (note the `docker:` prefix). On SLURM this
+                                  # REQUIRES the Pyxis SPANK plugin; omit on bare-host SLURM or launch fails.
+                                  # Empty string ("") == no image → runs on the bare launcher node.
           resources:
             cloud: <cloud>        # Optional. Per-step override of the env's default_cloud.
             cpus: "2+"            # SkyPilot resource string. "2+" = 2 or more vCPUs.
             memory: "4+"          # "4+" = 4 GiB or more.
             accelerators: A100:1  # Optional. e.g. "A100:8", "H100:1".
             disk_size: 50         # Optional. GB.
+            instance_type: <t>    # Optional. Cloud-specific VM/instance type (e.g. AWS "g5.xlarge").
+            use_spot: true        # Optional. Provision a spot/preemptible instance (cloud-dependent).
             infra: <infra-string> # Optional. Full infra spec, e.g. "slurm/cluster/partition".
                                   # If unset and `cluster` is set, gbserver builds "<cloud>/<cluster>[/<zone>]".
             cluster: <name>       # Optional. Combined with cloud to produce infra.
             zone: <zone>          # Optional. Cloud zone (LSF: queue name).
 
+          # ---- sky config overrides (SkyPilot's task-level `config:`) ----
+          docker:                 # Optional. Deep-merged into sky.Resources._cluster_config_overrides.
+            run_options:          # Only the `docker` section is passed through per-step; other SkyPilot
+              - "--shm-size=8g"   # config sections belong in the env-level `cloud_config` block.
+
           # ---- sky.Task ----
           setup: |                # Optional. Run once at cluster bring-up (cached across reuse).
             pip install foo bar
-          run: |                  # Required. The actual job each launch.
-            echo "LLMB_ARTIFACT_ID:my_out LLMB_ARTIFACT_PATH:/tmp/out.json"
+          run: |                  # Required. The actual job each launch. CWD is the per-run workdir
+            echo "LLMB_ARTIFACT_ID:my_out LLMB_ARTIFACT_PATH:/tmp/out.json"   # (or $HOME).
           envs:                   # Optional. Extra env vars. Merged AFTER env-level secrets and
             FOO: bar              # BEFORE config.launcher_config.envs. GB_* vars are auto-injected.
-          file_mounts:            # Optional. Two forms:
-            /remote/path: /local/path          # String → local-to-remote copy.
-            /remote/bucket-path:               # Dict → SkyPilot Storage mount.
+          file_mounts:            # Optional. Two forms (see "file_mounts" below):
+            /remote/path: /local/path          # String → local-to-remote copy (set_file_mounts).
+            /remote/bucket-path:               # Dict → SkyPilot Storage mount (set_storage_mounts).
               source: s3://bucket/prefix
               mode: MOUNT                       # MOUNT (default) or COPY.
 
+          post_launch_task:       # Optional. After the job starts, SSH to the host and run these
+            run: |                # commands out-of-band (e.g. start an evaluator sidecar). A failure
+              ./start-sidecar.sh  # is logged + surfaced as a MESSAGE_EVENT but does not fail the step.
+
           idle_minutes_to_autostop: 10         # Optional. Per-step override of the env-level value.
+                                               # Ignored on slurm/lsf (they don't support autostop).
     monitors:
       skypilot_monitor:
-        type: skypilot_monitor
+        ref: space://monitors/skypilot   # shared monitor (LLMB_ARTIFACT_* rules, 300s default poll)
         config:
-          poll_interval_seconds: 15
-          event_configs: [ ... ]  # Same schema as README.md#event_configs--log-line-parsing-rules.
+          # Optional overlay. Templated so a build.yaml step `config:` can override it.
+          poll_interval_seconds: "{{ config.poll_interval_seconds | default(900) }}"
+          log_retrieval:
+            mode: "{{ config.log_retrieval_mode | default('on_completion') }}"  # see "Log retrieval"
 ```
+
+### Field reference
+
+All fields below live under a launcher's `config:` block (referred to as the **`launcher_config`** in
+code). Every key here can be **overridden per-build** by the same key under a `build.yaml` step's
+`config.launcher_config.*` — that layer wins over the step.yaml default. This is why steps template
+values off `{{ config.* }}`: it lets a build supply resources/env without editing the step.
+
+#### `image_id`
+
+The container image, written with SkyPilot's `docker:` scheme prefix (e.g.
+`docker:python:3.11-slim`, `docker:vllm/vllm-openai:latest`). Resolution order is
+`config.launcher_config.image_id` (from build.yaml) → the launcher's own `image_id`. An **empty string
+renders to "no image"** (`None`), so the `run` script executes on the bare launcher node — the pattern
+the builtin `command` step uses:
+
+```yaml
+image_id: '{{ ("docker:" ~ config.command_config.image) if config.command_config.image else "" }}'
+```
+
+Cloud caveats: on **SLURM** a container image needs the Pyxis SPANK plugin installed on the cluster
+(bare-host SLURM must omit `image_id`); on **Kubernetes** the image runs as the pod image; on **AWS**
+it runs via Docker on the provisioned EC2 host.
+
+#### `run` (required) and `setup`
+
+`run` is the job body executed on every launch; `setup` runs once at cluster bring-up and is cached
+across cluster reuse (put `pip install`/downloads here, not in `run`). Both are shell scripts and are
+Jinja-templated against the step `config` — reference build inputs with `{{ config.<key> }}`. Both
+bodies run under `set -eu` (see **Failure semantics** below).
+
+- **Failure semantics (`set -eu`):** the launcher prepends `set -eu` to every `run` and `setup` body,
+  so a non-zero exit *anywhere* aborts the step and referencing an unset variable errors out — a body
+  need not add its own `set -eu`. This also governs the raw command a step interpolates: the
+  [`command`](../steps/command.md) step runs `{{ config.command_config.command }}` verbatim, so
+  `python train.py; echo done` never reaches `echo done` if `train.py` exits non-zero, and
+  `deploy.sh $OPTIONAL_FLAG` fails under `set -u` when `OPTIONAL_FLAG` is unset. Guard optional
+  variables with `${VAR:-}` and append `|| true` where a non-zero exit is acceptable. `pipefail` is
+  *not* enabled by default (it would change pipeline semantics for every step); add `set -o pipefail`
+  yourself if a failing command *within a pipeline* should fail the step.
+- **Artifacts:** emit a line matching `LLMB_ARTIFACT_ID:<id> LLMB_ARTIFACT_PATH:<path>` (or
+  `... LLMB_ARTIFACT_STATE:<value>` for an in-memory value) and the monitor registers it as the step's
+  output binding. The marker need not be at column 0 — retrieved SkyPilot logs prefix stdout lines.
+- **Working directory:** `setup` and `run` always start in the **same** directory, so a relative path
+  one phase writes (e.g. a repo `setup` clones) is read at the same place by the other. When the env
+  defines `shared_workdir`, that directory is a per-target-run workdir, so relative output paths are
+  isolated per run; without `shared_workdir` both phases run in SkyPilot's default `~/sky_workdir`
+  (where relative `file_mounts` also land — see [file_mounts](#file_mounts)). The shared CWD is
+  guaranteed by SkyPilot, which wraps both scripts with the same prologue that `cd`s into it. Prefer
+  relative paths — steps need not know where they run.
+
+#### `resources`
+
+Maps onto [`sky.Resources`](https://docs.skypilot.co/en/latest/reference/api.html#sky.Resources).
+gbserver passes through only `cloud`, `cpus`, `memory`, `accelerators`, `disk_size`, `instance_type`,
+`use_spot`, `infra`, `cluster`, and `zone`. `infra` is assembled from `cluster`/`zone` when not given
+explicitly (`<cloud>/<cluster>[/<zone>]`). Prefer numeric/`"N+"` strings for `cpus`/`memory`; note
+`cpus: "1+"` **breaks on the LSF cloud** (it parses the value as a float without stripping `+`), so
+cloud-agnostic steps leave `resources` empty and let the build.yaml supply them.
+
+> `compute_config` is **not** read by this launcher (unlike K8s/LSF) — see the dedicated note below.
+
+#### `config` overrides (`docker`)
+
+SkyPilot tasks accept a top-level `config:` block that overrides `~/.sky/config.yaml` per request; on
+`sky.Resources` this is `_cluster_config_overrides`. gbserver exposes **only the `docker` section** of
+it, as a launcher-level `docker:` key — e.g. `docker.run_options` to pass extra `docker run` flags
+(`--shm-size`, `--gpus`, `--ipc=host`). It merges `launcher_config.docker` with
+`config.launcher_config.docker` (build.yaml wins). Broader SkyPilot config (kubernetes, aws, nvidia,
+etc.) is not per-step — set it once at the env level via `cloud_config` (see "Inline config").
+
+#### `file_mounts`
+
+Read from `launcher_config.file_mounts` or the step's top-level `config.file_mounts`. Two value forms,
+which gbserver routes to different SkyPilot APIs:
+
+- **String** (`/remote: <source>`) → `Task.set_file_mounts` — copies a local path (or SkyPilot-supported
+  URI) to the remote path at bring-up. Works for files *and directories*.
+- **Dict** (`{source, mode}`) → `Task.set_storage_mounts` with a `sky.Storage`. `mode` is `MOUNT`
+  (default) or `COPY`. For a bucket URI with a sub-path (`s3://bucket/prefix`), gbserver splits it into
+  the bucket source plus a bucket sub-path automatically so `MOUNT` mode (which requires a bucket-only
+  source) works.
+
+**Source path resolution.** A **relative** local source is resolved against the **`step.yaml`
+directory** (the per-run asset dir gbserver renders the step into), so you can mount files that ship
+alongside your `step.yaml`. Absolute paths and remote URIs (`s3://`, `gs://`, `file://`, …) are used
+unchanged. A **`~`/`~/`-prefixed source is rejected**: `~` is not expanded for sources (it would
+resolve to a literal `~` directory under the `step.yaml` dir), so use an absolute or step-relative
+source instead. A **relative source that uses `..` to climb out of the `step.yaml` dir** (e.g.
+`../other`) is likewise rejected, keeping sources confined to the step's own assets.
+
+**Destination path resolution — the destination *shape* decides where the payload lands.** When the
+environment defines `shared_workdir` (so a per-run workdir exists), the destination key is routed by
+its shape:
+
+| Destination | Lands at | Scope / lifetime |
+|-------------|----------|------------------|
+| **relative** (`payload`, `./payload`, `sub/payload`) | `<per-run-workdir>/<dst>` — the run script's CWD | per-target-run, persistent, shared across the target's steps |
+| **absolute** (`/proj/…`, `/tmp/…`) | that literal path (author's responsibility) | as-is |
+
+A **`~`/`~/…` destination is rejected** (like a `~` source): `~` is not expanded by the launcher, so
+`file_mounts` has a single destination model — relative, or absolute for a fixed location.
+
+**Relative in, relative out.** Because the `run` script's CWD is the per-run workdir, a **relative**
+destination puts the payload at exactly `./<dst>` — the same path, relative to the step, that the
+source occupies next to your `step.yaml`. On shared-FS backends (bluevela `/proj`) that path is also
+visible **inside** the step container. This is the simplest option and gives implicit per-target
+isolation:
+
+```yaml
+config:
+  file_mounts:
+    payload: payload        # <step.yaml dir>/payload  →  <per-run-workdir>/payload
+  run: |
+    ./payload/run-eval.sh   # CWD is the per-run workdir, so the mount is right here
+```
+
+Use an **absolute** path only when you must hit a fixed location. When `shared_workdir` is *not* set,
+relative destinations fall back to SkyPilot's default (`~/sky_workdir/…`).
+
+#### `envs`, `post_launch_task`, `idle_minutes_to_autostop`
+
+- `envs` — extra environment variables for the job, merged after env-level secrets and before
+  `config.launcher_config.envs`; the auto-injected `GB_*` vars (below) always win.
+- `post_launch_task.run` — commands run on the host over SSH *after* the job starts (e.g. launching an
+  evaluator sidecar). A failure is logged and emitted as a `MESSAGE_EVENT` but does not fail the step.
+- `idle_minutes_to_autostop` — per-step override of the env-level autostop; ignored on `slurm`/`lsf`.
 
 ### Auto-injected environment variables
 
@@ -169,19 +312,42 @@ Added on top of (and overriding) anything in `envs`:
 | `GB_TARGETRUN_ID` | The enclosing target run id, when present. |
 | `GB_BUILD_ID` | The build id, when present. |
 | `GB_SHARED_WORKDIR` | The env-level `shared_workdir` path, when set. |
-| `GB_BUILD_WORKDIR` | Per-target-run subdir under `shared_workdir`, when set (also the run's initial CWD). |
 | `<env secrets>` | All secrets resolved from the env's `secret_refs`, merged before launcher `envs`. |
 
-### Monitoring & artifact-event timing caveat
+### `skypilot_monitor` config
 
-`skypilot_monitor` does **not** stream logs in real time. It polls `sky.job_status()` on
-`poll_interval_seconds`, and only **after** the job reaches a terminal status does it download the full
-log and walk every line through `event_configs`. Consequences:
+The monitor polls `sky.job_status()` and applies `event_configs` (the `LLMB_ARTIFACT_*` rules) to the
+job log. Two config keys shape its behavior:
 
-1. Artifact lines (`LLMB_ARTIFACT_ID:...`) are captured even if they scroll past a poll interval — log
-   download is offline, not tail-based.
-2. Artifacts are not registered until the job *completes*. There is no live event-monitor mode (unlike
-   the K8s `sidecar_monitor`), so a long step's artifact events are batched at the end.
+- **`poll_interval_seconds`** — status-poll cadence. **This gates completion detection:** the monitor
+  only notices a job finished on its next poll (it sleeps the interval between polls; success does not
+  wake it early), so a large interval delays detecting a *quick* job by up to that interval. The shared
+  `space://monitors/skypilot` monitor defaults to **300s**, trading detection latency for lower polling
+  load. Long-running steps (evals, training, services) override it *up* (e.g. `900`); build-test
+  fixtures override it *down* (e.g. `5`). Written as `{{ config.poll_interval_seconds | default(300) }}`,
+  so a `build.yaml` step `config:` sets it without touching the monitor.
+- **`log_retrieval.mode`** — when the job log is pulled and parsed for artifact events (below).
+
+#### Log retrieval modes
+
+Set `config.log_retrieval.mode` on the monitor (the shared monitor templates it off
+`{{ config.log_retrieval_mode | default('on_completion') }}`):
+
+| `mode` | Behavior | Cost |
+|--------|----------|------|
+| `on_completion` (default) | Download the full log **once**, at terminal status. | Lightest. |
+| `periodic` | Pull incrementally every `interval_seconds` (default = poll interval) while RUNNING, plus a final pull. | Medium. |
+| `startup_window` | Pull periodically only for the first `startup_window_seconds` (default 120) after RUNNING, then stop (still pulls once at terminal). | Low; for early bind-address/URL scraping. |
+| `stream` | Real-time `sky.tail_logs` follow stream. | Heaviest; opt-in. |
+
+Each pull resumes past the lines already parsed, so events are not re-emitted. Additional keys under
+`log_retrieval`: `interval_seconds` (periodic/startup cadence) and `startup_window_seconds`.
+
+**Implications for artifact timing:** in the default `on_completion` mode, artifact lines
+(`LLMB_ARTIFACT_ID:...`) are captured reliably even if they scrolled past a poll interval (download is
+offline, not tail-based), but they are not **registered until the job completes** — a long step's
+artifact events are batched at the end. Choose `periodic`/`stream` when a downstream step must consume
+an artifact mid-run.
 
 If a step exits with a non-`SUCCEEDED` JobStatus, the monitor emits a `WORKLOAD_STATUS_EVENT` with
 status `FAILED` so the build fails even when the workload wrote no status line.
