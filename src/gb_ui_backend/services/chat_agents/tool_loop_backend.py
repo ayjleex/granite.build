@@ -367,9 +367,12 @@ class ToolLoopBackend(ChatAgentBackend):
             )
         # Also backend-wide, not per session, for the same reason as
         # self._provider above: build_dashboard_tools() is a pure function
-        # of config — every session would otherwise reconstruct the same
-        # ToolSpecs (same descriptions, same JSON schemas) from scratch.
-        self._dashboard_tools = build_dashboard_tools(config)
+        # of config (and of self._gbmcp_enabled, fixed for the backend's life) —
+        # every session would otherwise reconstruct the same ToolSpecs (same
+        # descriptions, same JSON schemas) from scratch.
+        self._dashboard_tools = build_dashboard_tools(
+            config, gbmcp_available=self._gbmcp_enabled
+        )
 
     async def _run_session_owner(
         self,
