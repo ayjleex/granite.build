@@ -164,6 +164,69 @@ class TestPullassetHfstore:
             )
 
 
+class TestPriorityClassName:
+    """Guards for the optional ``k8s.priority_class_name`` pod PriorityClass.
+
+    Set per step via build.yaml ``config.k8s.priority_class_name`` (a free-form
+    passthrough into ``.Values.k8s``), it must land on the step pod ``spec`` as
+    ``priorityClassName``. The guarded line lives in the shared
+    ``gbstepbase.pyjobpod`` define, which every pod path includes (PyTorchJob
+    Master and Worker, and the single-pod Job), so one line covers them all.
+    Asserted against the template source, matching the umask/permission guards
+    above; a full ``helm template`` render is a separate manual/CI step.
+    """
+
+    HELPERS = CHART_DIR / "charts/gbstepbase/templates/_helpers.tpl"
+
+    # ``.Values.k8s.priority_class_name`` is unique to this feature in the chart,
+    # so whole-file substring checks are unambiguous -- no need to carve out the
+    # enclosing define. The line lives in the shared ``gbstepbase.pyjobpod`` define
+    # (the only pod spec), so it reaches every pod path: PyTorchJob Master/Worker
+    # and the single-pod Job.
+
+    def test_priority_class_name_emitted_from_config(self):
+        """The pod spec sets ``priorityClassName`` from ``k8s.priority_class_name``."""
+        text = self.HELPERS.read_text(encoding="utf-8")
+        assert "priorityClassName:" in text, "priorityClassName not emitted"
+        assert (
+            ".Values.k8s.priority_class_name" in text
+        ), "priorityClassName not driven by k8s.priority_class_name"
+
+    def test_priority_class_name_is_quoted(self):
+        """The value must be ``| quote``d.
+
+        PriorityClass names are DNS subdomains, so a leading-digit name (e.g.
+        ``123-high``) is legal; unquoted it renders as an int and the API server
+        rejects the pod, and YAML-1.1 words (``on``/``no``/``y``) would coerce to
+        bools. Pin the quote so the fix cannot silently regress.
+        """
+        text = self.HELPERS.read_text(encoding="utf-8")
+        assert (
+            "priorityClassName: {{ .Values.k8s.priority_class_name | quote }}" in text
+        ), "priorityClassName value is not `| quote`d"
+
+    def test_priority_class_name_is_guarded(self):
+        """Unset must render nothing -- no empty ``priorityClassName:`` line.
+
+        An empty value on a pod spec is invalid, so the block is gated on the
+        value being truthy (``{{- if .Values.k8s.priority_class_name }}``).
+        """
+        text = self.HELPERS.read_text(encoding="utf-8")
+        assert (
+            "if .Values.k8s.priority_class_name" in text
+        ), "priorityClassName is not guarded by an `if`"
+
+    def test_priority_class_name_default_is_unset(self):
+        """values-default.yaml must not ship an active value.
+
+        The default is the cluster default (no PriorityClass); the key is only
+        documented as a commented example so the guard stays false out of the box.
+        """
+        text = (CHART_DIR / "values-default.yaml").read_text(encoding="utf-8")
+        active = re.search(r"^\s*priority_class_name:\s*\S", text, re.MULTILINE)
+        assert active is None, "priority_class_name must default to unset (commented)"
+
+
 class TestSharedPvcPermissions:
     """Guards for the group-writable shared PVC settings.
 
