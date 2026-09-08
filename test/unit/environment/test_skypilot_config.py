@@ -127,22 +127,45 @@ class TestSshMerge:
         text = _read(tmp_path / ".slurm" / "config")
         assert "Host clusterA" in text and "Host clusterB" in text
 
-    def test_collision_same_alias_different_body(self, tmp_path):
+    def test_same_env_rekey_self_heals(self, tmp_path):
+        # A differing managed block owned by the SAME environment is overwritten
+        # (last-writer-wins), self-healing a stale or re-keyed entry left by an
+        # earlier run of that env. No lease, no refusal.
         sc.merge_ssh_blocks(
             "slurm",
             sc.render_ssh_hosts([_host("clusterA", HostName="a")], {}),
             "envA",
             home=tmp_path,
         )
-        with pytest.raises(SkypilotConfigCollisionError) as exc:
+        sc.merge_ssh_blocks(
+            "slurm",
+            sc.render_ssh_hosts([_host("clusterA", HostName="NEW")], {}),
+            "envA",  # same environment re-keying its own alias
+            home=tmp_path,
+        )
+        text = _read(tmp_path / ".slurm" / "config")
+        assert "HostName NEW" in text and "HostName a" not in text
+
+    def test_cross_env_alias_collision_raises(self, tmp_path):
+        # A differing managed block owned by a DIFFERENT environment is a
+        # cross-environment clash, not a re-key: gbserver refuses and names both
+        # environments rather than silently clobbering the other's host.
+        sc.merge_ssh_blocks(
+            "slurm",
+            sc.render_ssh_hosts([_host("clusterA", HostName="a")], {}),
+            "envA",
+            home=tmp_path,
+        )
+        with pytest.raises(SkypilotConfigCollisionError, match="envA"):
             sc.merge_ssh_blocks(
                 "slurm",
-                sc.render_ssh_hosts([_host("clusterA", HostName="DIFFERENT")], {}),
+                sc.render_ssh_hosts([_host("clusterA", HostName="NEW")], {}),
                 "envB",
                 home=tmp_path,
             )
-        msg = str(exc.value)
-        assert "clusterA" in msg and "envB" in msg and "envA" in msg
+        # The first environment's entry is left intact (no partial overwrite).
+        text = _read(tmp_path / ".slurm" / "config")
+        assert "HostName a" in text and "HostName NEW" not in text
 
     def test_foreign_content_preserved_and_differing_alias_conflicts(self, tmp_path):
         dest = tmp_path / ".slurm" / "config"
@@ -337,17 +360,26 @@ class TestIdentityKey:
         )
         assert _read(dest) == first  # stable content-addressed path, no churn
 
-    def test_same_alias_different_key_collides(self, tmp_path):
+    def test_same_alias_different_key_replaces(self, tmp_path):
+        # Re-keying the same alias self-heals (replaces the stale managed block)
+        # instead of colliding. This is the stale-config bug fix — previously this
+        # raised and required a manual file delete.
         self._materialize(
             tmp_path, {"BV_KEY": self._PEM}, HostName="h", IdentityKey="BV_KEY"
         )
-        with pytest.raises(SkypilotConfigCollisionError):
-            self._materialize(
-                tmp_path,
-                {"BV_KEY": "-----DIFFERENT KEY-----"},
-                HostName="h",
-                IdentityKey="BV_KEY",
-            )
+        dest = self._materialize(
+            tmp_path,
+            {"BV_KEY": "-----DIFFERENT KEY-----"},
+            HostName="h",
+            IdentityKey="BV_KEY",
+        )
+        text = _read(dest)
+        new_key = next(
+            k
+            for k in (tmp_path / ".sky" / "keys").glob("*.key")
+            if k.read_text(encoding="utf-8").startswith("-----DIFFERENT")
+        )
+        assert f"IdentityFile {new_key}" in text
 
     def test_both_identityfile_and_identitykey_raises(self, tmp_path):
         with pytest.raises(ValueError):
