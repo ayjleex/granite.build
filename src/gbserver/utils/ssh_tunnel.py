@@ -33,7 +33,8 @@ Usage::
 """
 
 import asyncio
-from typing import List, Optional, Tuple
+import contextlib
+from typing import AsyncIterator, List, Optional, Tuple
 
 from gbserver.utils.optional_imports import HAS_ASYNCSSH
 
@@ -95,6 +96,14 @@ class SshTunnel:
         self._listeners: List[asyncssh.SSHListener] = []
         self._actual_local_ports: List[int] = []
         self._semaphore = asyncio.Semaphore(max_sessions)
+        # In-flight operation refcount, so a superseded tunnel is closed only
+        # once nothing is still using its connection or port forward.
+        self._inflight = 0
+        self._idle = asyncio.Event()
+        self._idle.set()
+        # Set once retirement/close begins, so use() fails fast instead of
+        # running against a connection about to drop.
+        self._closing = False
 
     # ------------------------------------------------------------------
     # Public API
@@ -146,8 +155,76 @@ class SshTunnel:
 
         logger.info("[SshTunnel] Connected to %s", self.host)
 
+    def is_healthy(self) -> bool:
+        """Best-effort, non-throwing check that the connection is open.
+
+        A True result doesn't guarantee the next command succeeds; callers must
+        still handle a command failing and re-establish.
+        """
+        if self._closing:
+            return False
+        conn = self._conn
+        if conn is None:
+            return False
+        try:
+            if conn.is_closed():
+                return False
+        except Exception:  # noqa: BLE001 — introspection must never raise
+            return False
+        # A live control connection is not enough: a lost port forward would let
+        # commands run but break scp/rsync. Require every configured forward to
+        # still have a listener (close() clears these). asyncssh exposes no
+        # per-listener liveness, so this catches teardown, not a silently dropped
+        # forward — the caller's own command failure is the backstop for that.
+        return len(self._listeners) == len(self.port_forwards)
+
+    @contextlib.asynccontextmanager
+    async def use(self) -> AsyncIterator["SshTunnel"]:
+        """Mark this tunnel in-use for the duration of an operation.
+
+        A tunnel with in-flight uses won't be closed by ``close_when_idle`` (see
+        the retire path in the LSF environment), so a rebuild elsewhere can't tear
+        down the connection or port forward mid-transfer.
+
+        Raises ``SshTunnelError`` if the tunnel is already closing/closed, so a
+        caller that raced the retire path fails fast and re-establishes rather
+        than running against a dead connection.
+        """
+        if self._closing or self._conn is None:
+            raise SshTunnelError(
+                f"[SshTunnel] Cannot use tunnel to {self.host}: it is closing or closed"
+            )
+        self._inflight += 1
+        self._idle.clear()
+        try:
+            yield self
+        finally:
+            self._inflight -= 1
+            if self._inflight <= 0:
+                self._inflight = 0
+                self._idle.set()
+
+    async def close_when_idle(self, timeout: Optional[float] = None) -> None:
+        """Wait for in-flight uses to drain, then close. Used to retire a tunnel.
+
+        With ``timeout`` (seconds), close anyway once it elapses so a stuck
+        operation can't wedge the caller (e.g. teardown) indefinitely.
+        """
+        # Block new use() entrants immediately so the refcount can reach zero.
+        self._closing = True
+        try:
+            await asyncio.wait_for(self._idle.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[SshTunnel] %s still in use after %.0fs; closing anyway",
+                self.host,
+                timeout,
+            )
+        await self.close()
+
     async def close(self) -> None:
         """Close all port-forward listeners and the SSH connection."""
+        self._closing = True
         for listener in self._listeners:
             listener.close()
             await listener.wait_closed()
