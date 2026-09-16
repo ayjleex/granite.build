@@ -403,6 +403,17 @@ const LineagePanelInner = React.forwardRef<GraphHandle, LineagePanelProps>(funct
     [showFocusNode, initialFocusNodeId, enrichedNodes]
   )
 
+  // The node whose step drawer is open. Opening that drawer is what shrinks the
+  // graph pane, so this is the node the resize compensation must keep on-screen —
+  // and, unlike currentArtifactNode, it is set on build pages (where the drawer
+  // exists) rather than only on artifact pages.
+  const openDrawerNode = React.useMemo(
+    () => (stepDetailTarget
+      ? enrichedNodes.find((n) => n.id === `${TARGET_NODE_PREFIX}${stepDetailTarget}`)
+      : undefined),
+    [stepDetailTarget, enrichedNodes]
+  )
+
   const { filteredNodes, filteredLinks } = React.useMemo(() => {
     if (!focusNodeId || (upstreamLevels === Infinity && downstreamLevels === Infinity)) {
       return { filteredNodes: enrichedNodes, filteredLinks: allLinks }
@@ -606,7 +617,7 @@ const LineagePanelInner = React.forwardRef<GraphHandle, LineagePanelProps>(funct
               nodes={filteredNodes}
               links={filteredLinks}
               allLinks={allLinks}
-              selectedNode={currentArtifactNode}
+              selectedNode={currentArtifactNode ?? openDrawerNode}
               onClick={handleNodeClick}
               onSvgRendered={() => setRendered(true)}
             />
@@ -625,7 +636,7 @@ const LineagePanelInner = React.forwardRef<GraphHandle, LineagePanelProps>(funct
         >
           {(() => {
             const target = buildStatus?.targets?.[stepDetailTarget]
-            const { status, subtitle, summary } = stepDrawerSummary(target)
+            const { status, subtitle, summary } = stepDrawerSummary(target, build)
             return (
               <>
                 <div className={styles.stepSidePanelHeader}>

@@ -3,11 +3,14 @@
 import * as React from 'react'
 import { CopyButton, Link } from '@carbon/react'
 import styles from './LineagePanel.module.scss'
-import type { BuildStepRun, BuildTargetRun } from '@granite-build/ui-core/types'
+import type { Build, BuildStepRun, BuildTargetRun } from '@granite-build/ui-core/types'
 import { BuildStatusBadge } from '@granite-build/ui-core/components/BuildStatusBadge'
 import { formatDurationBetween } from '@granite-build/ui-core/lib/duration'
 
 const NOT_RECORDED = 'Not recorded'
+
+/** Build statuses that mean the build is still in flight. Mirrors LineagePanel. */
+const ACTIVE_STATUSES = new Set(['running', 'submitted', 'pending', 'cancel_requested'])
 
 /** `10:51:22` — the clock time alone, for the compact Execution row. */
 function formatClock(value: string | undefined): string {
@@ -35,9 +38,18 @@ function formatDateTime(value: string | undefined): string | undefined {
   return `${date} at ${time}`
 }
 
-/** The step's own finish time, falling back to the mirrored `updated_at`. */
+/**
+ * The step's own finish time, and only that.
+ *
+ * There is deliberately no `updated_at` fallback. gbserver has no step-level
+ * `updated_at` (StoredStepRun records `started_at`/`finished_at` only), and
+ * adaptStepRun mirrors the *same* `finished_at` into both fields — so the
+ * fallback could never supply a time `finished_at` lacked. A step that recorded
+ * no finish time reports none, and callers show "Not recorded" or bound the span
+ * with the build's own finish time rather than inventing one.
+ */
 function finishedAt(step: BuildStepRun): string | undefined {
-  return step.finished_at ?? step.updated_at
+  return step.finished_at
 }
 
 /**
@@ -86,11 +98,14 @@ function cleanStatusMessage(msg: string): string {
   // `extra_msg` is appended after the closing fence — so the redundant-key
   // heuristic must run on fenced lines, and free text outside survives verbatim.
   let inFence = false
+  // 1-based index of the fenced block a line sits in (0 = outside any fence).
+  let fenceIndex = 0
   return msg
     .split('\n')
     .filter((line) => {
       if (/^\s*```/.test(line)) {
         inFence = !inFence
+        if (inFence) fenceIndex += 1
         return false // drop the fence marker itself either way
       }
 
@@ -98,6 +113,13 @@ function cleanStatusMessage(msg: string): string {
       // above; drop them. Only outside a fence, where a `#` line is a heading
       // rather than a shell comment in a captured command.
       if (!inFence && /^#+\s/.test(line)) return false
+
+      // Only gbserver's own metadata table is redundant, and it lives in the
+      // *first* fenced block (Run.create_message emits it before anything else).
+      // A later fence is captured command output, whose lines may coincidentally
+      // read as `Key : Value` — dropping those deletes real content the user
+      // cannot see anywhere else, so leave every line past the first fence alone.
+      if (fenceIndex > 1) return true
 
       // Capture the key, the run of spaces before the colon, and the value.
       const match = /^\s*([A-Za-z][A-Za-z ]*?)( *):\s*(.*)$/.exec(line)
@@ -337,7 +359,7 @@ function buildConfigGroups(config: Record<string, unknown>): ConfigGroup[] {
 
 /**
  * The step's runtime metadata as scalar rows. This is StoredStepRun.metadata —
- * key/values the step pushed at execution time via the LLMB_STEP_METADATA hook
+ * key/values the step pushed at execution time via the GB_STEP_METADATA_KEY/VALUE hook
  * (a resolved git `commit_hash` is the documented example), distinct from the
  * declared `config`.
  */
@@ -449,7 +471,12 @@ function StepCard({
   const configGroups = React.useMemo(() => buildConfigGroups(rest), [rest])
   const restKeys = Object.keys(rest)
   const metaRows = metadataRows(step.metadata)
-  const message = step.status_msg ? cleanStatusMessage(step.status_msg) : ''
+  // Heavy regex/line-split; memoize so it does not rerun for every StepCard on
+  // each status poll tick when the message has not changed.
+  const message = React.useMemo(
+    () => (step.status_msg ? cleanStatusMessage(step.status_msg) : ''),
+    [step.status_msg]
+  )
   const [showRaw, setShowRaw] = React.useState(false)
   const [showCommand, setShowCommand] = React.useState(false)
 
@@ -633,8 +660,17 @@ export default function StepDetailsPanel({
   )
 }
 
-/** Header metadata for the drawer — derived here so the header and body agree. */
-export function stepDrawerSummary(target: BuildTargetRun | undefined): {
+/**
+ * Header metadata for the drawer — derived here so the header and body agree.
+ *
+ * `build` is optional but should be passed whenever it is known: a target whose
+ * steps never recorded a finish time needs the build's own finish time to bound
+ * its duration. See the `isRunning` note below.
+ */
+export function stepDrawerSummary(
+  target: BuildTargetRun | undefined,
+  build?: Pick<Build, 'status' | 'finished_at'>,
+): {
   status: BuildStepRun['status'] | undefined
   subtitle: string
   summary: string | undefined
@@ -664,14 +700,29 @@ export function stepDrawerSummary(target: BuildTargetRun | undefined): {
   // *finished* steps understates the target: a target whose second step has run
   // for 40m would otherwise report only the 5m its first step took. While any
   // step is unfinished the target is still elapsing, so measure to now instead.
-  const isRunning = steps.some((s) => !finishedAt(s))
+  //
+  // A missing finish time does not prove that, though. A cancelled or failed step
+  // often never writes one, and measuring to now then reports a run that took
+  // minutes as "Ran for 3d 4h", growing every second the drawer stays open. The
+  // build is the authority: once it has stopped nothing under it is still
+  // running, and its `finished_at` is the real upper bound for the span.
+  const buildFinished = build?.finished_at
+  const buildStopped = Boolean(build && !ACTIVE_STATUSES.has(build.status))
+  const isRunning = steps.some((s) => !finishedAt(s)) && !buildStopped
   const finishTimes = steps
     .map((s) => finishedAt(s))
     .filter((t): t is string => Boolean(t) && Number.isFinite(Date.parse(t as string)))
   const lastFinished = finishTimes.length
     ? finishTimes.reduce((latest, t) => (Date.parse(t) > Date.parse(latest) ? t : latest))
     : undefined
-  const finished = isRunning ? undefined : lastFinished
+  // Prefer the build's finish time over the last step's when the build has
+  // stopped but a step's own finish time is missing, since the steps then
+  // understate (or entirely lack) the span.
+  const finished = isRunning
+    ? undefined
+    : buildStopped && (!lastFinished || steps.some((s) => !finishedAt(s)))
+      ? (buildFinished ?? lastFinished)
+      : lastFinished
   const duration = formatDurationBetween(
     started,
     isRunning ? new Date().toISOString() : finished,

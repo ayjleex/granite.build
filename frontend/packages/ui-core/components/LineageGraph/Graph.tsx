@@ -243,6 +243,11 @@ function GraphComponent(props: GraphProps, ref: React.Ref<GraphHandle>) {
   const transformRef = React.useRef(INITIAL_TRANSFORM)
   // Once the user pans or zooms, stop auto-fitting so we never yank their view.
   const hasUserAdjustedRef = React.useRef(false)
+  // The resize observer needs the *current* selection, but must not re-subscribe
+  // every time it changes (that would re-seed lastWidth and lose the delta), so
+  // read it through a ref rather than closing over the prop.
+  const selectedNodeRef = React.useRef(props.selectedNode)
+  selectedNodeRef.current = props.selectedNode
 
   // A different graph (new artifact/build) earns a fresh fit even if the user had
   // panned the previous one. Identity must be stable for the *same* graph as it
@@ -362,25 +367,78 @@ function GraphComponent(props: GraphProps, ref: React.Ref<GraphHandle>) {
     }
   }, [nodeElements, computeFitTransform])
 
-  // Re-fit on container resize while the user has not taken over the viewport.
-  // Coalesce bursts (a drag-resize fires the observer many times per second)
-  // into one refit per animation frame rather than recomputing + applying a
-  // transform on every single firing.
+  // Handle container resize. Coalesce bursts (a drag-resize fires the observer
+  // many times per second) into one update per animation frame rather than
+  // recomputing + applying a transform on every single firing.
+  //
+  // Two cases, split on whether the user owns the viewport:
+  //   - untouched: recompute the fit, as before.
+  //   - user-adjusted: keep their scale and shift by half the width delta, so
+  //     whatever was centered stays centered, then pull the selected node back
+  //     inside the pane if the shift still left it outside. Opening the ~33rem
+  //     drawer shrinks the SVG by ~528px; without this the transform is unchanged
+  //     and focused content slides out of view with no way back but Reset.
+  // Their zoom level is never discarded either way.
   React.useEffect(() => {
     const svg = svgRef.current
     if (!svg || typeof ResizeObserver === 'undefined') return
 
+    // Seeded on first observation below, so the initial firing is a no-op rather
+    // than a shift against a phantom width of 0.
+    let lastWidth = 0
     let rafId = 0
     const observer = new ResizeObserver(() => {
       if (rafId) return
       rafId = requestAnimationFrame(() => {
         rafId = 0
-        if (hasUserAdjustedRef.current || !zoomRef.current) return
-        const fit = computeFitTransform()
-        if (fit) d3.select(svg).call(zoomRef.current.transform, fit)
+        if (!zoomRef.current) return
+        const width = svg.clientWidth
+        const previousWidth = lastWidth
+        lastWidth = width
+
+        if (!hasUserAdjustedRef.current) {
+          const fit = computeFitTransform()
+          if (fit) d3.select(svg).call(zoomRef.current.transform, fit)
+          return
+        }
+
+        // Recentre on the user's own transform. `transformRef` is kept current by
+        // the zoom handler, so this composes with their latest pan/zoom rather
+        // than a stale one.
+        if (!previousWidth || !width || width === previousWidth) return
+        const current = transformRef.current
+        let shifted = current.translate((width - previousWidth) / 2 / current.k, 0)
+
+        // Half-the-delta keeps the *centre* fixed, which is the right default but
+        // not enough on its own: a selected node already near an edge can still
+        // land outside the narrowed pane. When there is a selection — the node
+        // whose drawer caused the resize, and the one thing the user is certainly
+        // looking at — pull it back inside the visible band instead.
+        const selected = selectedNodeRef.current
+        const pos = selected
+          ? positionsRef.current?.children?.find((n) => n.id === selected.id)
+          : undefined
+        if (pos && width > FIT_PADDING * 2) {
+          const applied = BASE_SCALE * shifted.k
+          // Node bounds in screen space under the shifted transform.
+          const left = shifted.x + (pos.x ?? 0) * applied
+          const right = left + (pos.width ?? 0) * applied
+          const overflowRight = right - (width - FIT_PADDING)
+          const overflowLeft = FIT_PADDING - left
+          // Correct the left edge first. A node wider than the pane overflows both
+          // sides at once and cannot be fully shown; pinning its left edge reveals
+          // where it starts, and picking one side unconditionally also keeps the
+          // choice stable instead of alternating between edges on every resize.
+          const correction =
+            overflowLeft > 0 ? overflowLeft : overflowRight > 0 ? -overflowRight : 0
+          if (correction !== 0) shifted = shifted.translate(correction / shifted.k, 0)
+        }
+
+        d3.select(svg).call(zoomRef.current.transform, shifted)
       })
     })
     observer.observe(svg)
+    lastWidth = svg.clientWidth
     return () => {
       if (rafId) cancelAnimationFrame(rafId)
       observer.disconnect()

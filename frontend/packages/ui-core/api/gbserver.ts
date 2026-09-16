@@ -101,12 +101,18 @@ function stepImageFromConfig(config: Record<string, unknown> | undefined): strin
   if (!config) return undefined
   const launcherConfig = (config.launcher_config as Record<string, unknown>) ?? {}
   const dockerConfig = (config.docker as Record<string, unknown>) ?? {}
+  // `config.skypilot.image_id` is a real field of StepSkypilotConfig
+  // (types/environment/skypilot.py) that a step may set, so read it rather than
+  // reporting "Not recorded" for a step that named an image. It sits last
+  // because the launch path resolves launcher_config.image_id first.
+  const skypilotConfig = (config.skypilot as Record<string, unknown>) ?? {}
   const candidates = [
     launcherConfig.image,
     launcherConfig.image_id,
     dockerConfig.image,
     config.image,
     config.image_id,
+    skypilotConfig.image_id,
   ]
   for (const candidate of candidates) {
     if (typeof candidate === 'string' && candidate.trim()) return candidate
@@ -194,9 +200,17 @@ function inferArtifactTypeFromUri(uri: string): import('../types').ArtifactType 
   // which requires an hf:// prefix). Without the scope guard a plain
   // `cos://bucket/datasets/eval.json` would be misread as a DATASET.
   if (!/^(hf:\/\/|https:\/\/huggingface\.co\/)/.test(uri)) return null
-  // Match the type segment in hf://[domain]/<type>/org/name or
-  // hf:///<type>/org/name and in https://huggingface.co/<type>/org/name.
-  const m = uri.match(/(?:^|\/)(datasets|models|spaces|buckets)\//)
+  // The type keyword is only meaningful in the FIRST path segment — that is the
+  // only slot the backend inspects (HfURI.parse consumes parts[0] when it is a
+  // known keyword, else defaults to MODEL). Matching it anywhere would mislabel
+  // a URI whose org or repo happens to be named `models`/`datasets`, e.g.
+  // hf:///acme/datasets/v1. Strip scheme + optional host, then read one segment.
+  const path = uri
+    .replace(/^hf:\/\//, '')
+    .replace(/^https:\/\/huggingface\.co/, '')
+    .replace(/^[^/]*/, '') // drop the host (empty for hf:///... triple slash)
+    .replace(/^\/+/, '')
+  const m = /^(datasets|models|spaces|buckets)\//.exec(path)
   if (m) {
     switch (m[1]) {
       case 'datasets': return 'DATASET'
