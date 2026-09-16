@@ -87,16 +87,21 @@ hf_env_flag() {
 HFPULL_LOCK_TTL_DEFAULT=900
 HFPULL_LOCK_TTL_MAX=31536000
 hfpull_lock_ttl() {
-    local raw="${GB_HFPULL_LOCK_TIMEOUT:-}" intpart secs
+    local raw="${GB_HFPULL_LOCK_TIMEOUT:-}" intpart secs ndigits
     if [[ -z "${raw// }" ]]; then echo "${HFPULL_LOCK_TTL_DEFAULT}"; return; fi
     if [[ "${raw}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
         intpart="${raw%%.*}"
         # Strip leading zeros so the digit-count guard below is on the true
         # magnitude (all-zeros -> empty -> 0).
         intpart="${intpart#"${intpart%%[!0]*}"}"; [[ -z "${intpart}" ]] && intpart=0
-        # >8 significant digits necessarily exceeds the 1-year cap and would risk
-        # overflowing bash arithmetic, so clamp before computing.
-        if (( ${#intpart} > 8 )); then
+        # >8 significant digits exceeds the 1-year cap and risks overflowing bash
+        # arithmetic, so clamp before computing. Count digits with `wc -c`, not
+        # the bash length expansion: this script is rendered through Jinja, and
+        # that expansion's `brace-hash` opens a Jinja comment (no close) and fails
+        # the render (nightly regression) -- so this comment must avoid it too.
+        # intpart is pure digits, so byte count == digit count.
+        ndigits="$(printf %s "${intpart}" | wc -c)"
+        if (( ndigits > 8 )); then
             secs="${HFPULL_LOCK_TTL_MAX}"
         else
             secs=$(( 10#${intpart} ))  # base 10 so a leading zero is not octal

@@ -100,6 +100,29 @@ When unset, gbserver-managed caches fall back to `~/.cache/gbserver/<store>` on 
 works when consecutive steps land on the same machine. Example paths per backend: `slurm: /shared`
 (NFS/Lustre/GPFS), `k8s: /mnt/shared` (RWX PVC), `aws: /mnt/efs` (EFS/FSx).
 
+#### Containerized steps must also see the shared workdir *inside* the container
+
+`shared_workdir` being present on the worker is enough for a **bare** step — it runs directly on the
+host and sees the filesystem. A step that sets an `image_id` is different: its `run` executes inside a
+container whose filesystem is **not** the host's, so the per-run workdir (the step's CWD) must *also*
+be visible inside that container. When it isn't, the launcher's `cd "$GB_BUILD_WORKDIR"` lands in the
+container's ephemeral writable layer, the step writes its output there, and that layer is discarded at
+teardown — a later step (e.g. the auto-queued `hfpush`) then fails with `<path> does not exist`.
+
+How the shared filesystem is exposed to a container differs by backend:
+
+- **SLURM** — the enroot container mounts only the account home, ccache, and the SkyPilot `workdir`;
+  set `workdir` to an ancestor of `shared_workdir`. See
+  [skypilot-slurm.md](skypilot-slurm.md#workdir-containerized-steps).
+- **LSF** — the shared-FS roots (`/proj`, `/opt/share`) are bind-mounted *identity* into the container
+  automatically, so a `shared_workdir` under one of them just works. See
+  [skypilot-lsf.md](skypilot-lsf.md#file_mounts-inside-enroot-containers).
+- **Kubernetes** — the step image *is* the pod, so a PVC attached as a pod volume is already the
+  container's filesystem (no host/container split). See
+  [skypilot-kubernetes.md](skypilot-kubernetes.md#shared_workdir).
+- **AWS** — EFS/FSx is mounted on the VM; a bare step sees it directly, a containerized step needs the
+  mount visible inside the container. See [skypilot-aws.md](skypilot-aws.md#shared_workdir).
+
 ## `step.yaml` — launcher and monitor types
 
 | `type` | Method | Notes |
@@ -150,7 +173,7 @@ environment_configs:
             pip install foo bar
           run: |                  # Required. The actual job each launch. CWD is the per-run workdir
             echo "GB_ARTIFACT_ID:my_out GB_ARTIFACT_PATH:/tmp/out.json"   # (or $HOME).
-          envs:                   # Optional. Extra env vars. Merged AFTER env-level secrets and
+          envs:                   # Optional. Extra env vars. Merged AFTER declared secrets and
             FOO: bar              # BEFORE config.launcher_config.envs. GB_* vars are auto-injected.
           file_mounts:            # Optional. Two forms (see "file_mounts" below):
             /remote/path: /local/path          # String → local-to-remote copy (set_file_mounts).
@@ -296,11 +319,34 @@ relative destinations fall back to SkyPilot's default (`~/sky_workdir/…`).
 
 #### `envs`, `post_launch_task`, `idle_minutes_to_autostop`
 
-- `envs` — extra environment variables for the job, merged after env-level secrets and before
+- `envs` — extra environment variables for the job, merged after declared secrets and before
   `config.launcher_config.envs`; the auto-injected `GB_*` vars (below) always win.
 - `post_launch_task.run` — commands run on the host over SSH *after* the job starts (e.g. launching an
   evaluator sidecar). A failure is logged and emitted as a `MESSAGE_EVENT` but does not fail the step.
 - `idle_minutes_to_autostop` — per-step override of the env-level autostop; ignored on `slurm`/`lsf`.
+
+### Step `config` blocks read by SkyPilot
+
+Mirroring `config.lsf` / `config.k8s`, a step declares its SkyPilot secrets under `config.skypilot`:
+
+```yaml
+config:
+  skypilot:
+    secrets:
+      secret_names_to_use_as_env_variable:
+        - env_name: MY_TOKEN        # Env var injected into the launched task.
+          secret_name: my_secret    # Space/user secret to read; falls back to env_name.
+```
+
+Only the secrets listed here are injected as task env vars — **least-privilege**, matching LSF and
+K8s. The full space/user secret bag is **not** dumped into the task (an earlier behavior). A declared
+secret that is absent from the resolved secret bag fails the launch fast with a `ValueError` (the
+secret *value* is never included in the message). This applies to both the unmanaged `Skypilot`
+launcher and `Skypilot_managed`.
+
+> **Migration note:** custom SkyPilot steps that implicitly relied on an undeclared secret being
+> present as an env var must now declare it here. Built-in asset steps are unaffected — they receive
+> their tokens via explicit launcher `envs` (e.g. `HF_TOKEN`), not the secret bag.
 
 ### Auto-injected environment variables
 
@@ -313,7 +359,7 @@ Added on top of (and overriding) anything in `envs`:
 | `GB_TARGETRUN_ID` | The enclosing target run id, when present. |
 | `GB_BUILD_ID` | The build id, when present. |
 | `GB_SHARED_WORKDIR` | The env-level `shared_workdir` path, when set. |
-| `<env secrets>` | All secrets resolved from the env's `secret_refs`, merged before launcher `envs`. |
+| `<declared secrets>` | Only the secrets a step declares in `config.skypilot.secrets.secret_names_to_use_as_env_variable` (see below), merged before launcher `envs`. |
 
 ### `skypilot_monitor` config
 
@@ -367,12 +413,24 @@ pre-provisioning SkyPilot config files on the gbserver host, gbserver materializ
   every `aws_credentials` value is looked up by exact name in the environment's secrets; a match is
   substituted, otherwise the literal is used. Keep credentials and sensitive hostnames as secret
   *names* so a git-tracked asset carries no secret material.
-- **Content-aware merge, refuse-on-conflict.** Different clusters (distinct `Host` aliases) and AWS
-  profiles coexist. An *identical* pre-existing entry is a no-op; a genuinely different one for the same
-  alias/profile/leaf key raises `SkypilotConfigCollisionError`. Unrelated/foreign entries are preserved.
-- **No teardown.** Materialized config is left in place (safe and idempotent); not removed on completion.
-- **Concurrency.** Host-shared files are guarded by a cross-process file lock plus an in-process thread
-  lock, so materialization is safe for any `GBSERVER_DEFAULT_BUILDRUNNER_TYPE` (thread/process/job).
+- **Content-aware merge.** Different clusters (distinct `Host` aliases) and AWS profiles coexist, and a
+  SLURM env and an LSF env run concurrently (separate files). An *identical* pre-existing entry is a
+  no-op; a *foreign* (non-gbserver) entry for the same alias always conflicts
+  (`SkypilotConfigCollisionError`) — gbserver never overwrites user-owned entries.
+- **Last-writer-wins (SSH `Host` blocks).** A *differing* gbserver-managed block for the same alias is
+  **overwritten** — this self-heals a stale or re-keyed entry left by an earlier run, so no manual `rm`
+  is ever needed. The *same* block is a no-op (shared freely by concurrent steps/builds). Only a
+  *foreign* (non-gbserver) entry for the same alias is refused (`SkypilotConfigCollisionError`).
+- **No config teardown.** Materialized config files are left in place (safe and idempotent). Single-host
+  by design (the config files are host-local).
+- **Concurrency.** Host-shared files are guarded by a per-cloud cross-process file lock
+  (`gbserver-<cloud>.lock`) plus an in-process thread lock, so materialization is safe for any
+  `GBSERVER_DEFAULT_BUILDRUNNER_TYPE` (thread/process/job).
+- **Re-keying (test-only `GBTEST_SKY_SSH_RESET`).** SkyPilot reuses a persisted SSH ControlMaster
+  socket keyed on `(host, port, user)` — **not** the key — so a re-keyed HPC config can be masked by a
+  live connection for its `ControlPersist` window. Setting `GBTEST_SKY_SSH_RESET=true` makes gbserver
+  clear those sockets before each HPC launch, forcing re-authentication. Test-only (manually set,
+  unconditional); production never clears sockets. It is not an environment-config key.
 
 The exact contents of each block are cloud-specific — see the per-cloud pages:
 [SLURM](skypilot-slurm.md) and [LSF](skypilot-lsf.md) use `cluster_ssh_configs` (and LSF often

@@ -40,6 +40,22 @@ config:
                                     # on-host key path. Specifying both is an error.
 ```
 
+gbserver merges this block into `~/.lsf/config` with last-writer-wins semantics: a differing
+gbserver-managed block for the same alias is **overwritten** (a stale or re-keyed entry self-heals —
+no manual `rm ~/.lsf/config`); a *foreign* (non-gbserver) entry for the same alias is refused
+(`SkypilotConfigCollisionError`). An LSF and a SLURM env run concurrently (separate files). See
+[Inline SkyPilot config](skypilot.md#inline-skypilot-config-cluster_ssh_configs--cloud_config--aws_credentials).
+
+> **Re-keying caveat (test-only `GBTEST_SKY_SSH_RESET`).** Even after `~/.lsf/config` self-heals,
+> SkyPilot reuses a persisted SSH ControlMaster socket keyed on `(host, port, user)` — **not** the key
+> — so a changed `IdentityFile`/`IdentityKey` can be masked by a live connection until its
+> `ControlPersist` window expires (300s, or up to 1 day on the interactive-auth path). To validate a
+> credential change against a freshly edited key, set `GBTEST_SKY_SSH_RESET=true` in gbserver's
+> environment: on each HPC launch gbserver then clears the persisted control sockets first, forcing
+> re-authentication with the current key. This is a **test-only** toggle (manually set, unconditional
+> — not idle-gated); production never clears sockets, since the socket root is shared by all of the OS
+> user's SkyPilot SSH connections. It is not an environment-config key.
+
 ### `cloud_config.lsf` — behavioral tuning
 
 Structured LSF settings that can't live in the SSH file are deep-merged into `~/.sky/config.yaml`:
@@ -71,6 +87,13 @@ config:
 SkyPilot's `zone` is overloaded per-cloud; for LSF it maps to the **queue** name (e.g. `normal`,
 `preemptable`). Recipes that expose a `QUEUE` build parameter typically plumb it through
 `resources.zone` on the step launcher (`zone: "$${QUEUE}"`).
+
+LSF is an HPC cloud, so `cluster` and `zone` (queue) resolve with the same layered precedence as
+SLURM — resources override > step/build `config` > this `environment.yaml` `config` — so the queue
+can be pinned at env level instead of on every launcher. See
+[skypilot-slurm.md](skypilot-slurm.md#cluster--zone) for the full precedence. As there, a `zone`
+(queue) set **without** a `cluster` is rejected: SkyPilot cannot express a queue without a cluster,
+so set a `cluster` alongside it.
 
 ### Autostop is ignored
 
@@ -149,6 +172,15 @@ targets:
 > Container images (`image_id` / `image_id` in the step config) require enroot on the LSF nodes — see
 > the `cloud_config.lsf.cluster_configs.<cluster>.enroot` block above.
 
+> **Container images must be Debian/Ubuntu-based (apt).** When running in a container, SkyPilot
+> bootstraps its in-container SSH shim with `apt-get`, so only Debian-based images are supported (see
+> the SkyPilot [Docker containers docs](https://docs.skypilot.ai/en/latest/examples/docker-containers.html)).
+> A non-Debian image (e.g. a Fedora/RPM image) pulls fine but fails during job setup — enroot launches
+> it, the `apt-get` step exits non-zero, and the failure surfaces only as a generic
+> `ResourcesUnavailableError`. Confirm with `sacct -j <job_id> --format=JobID,State,ExitCode,Reason`:
+> the container-setup sub-steps show `FAILED 1:0` while the host-side steps complete. The image must
+> also grant passwordless `sudo` (or run as root).
+
 ### `file_mounts` inside enroot containers
 
 With an image, the step's `run` executes inside an enroot container on the compute node, which has its
@@ -171,6 +203,15 @@ destination shape:
 
 Prefer a **relative** destination (see [file_mounts](skypilot.md#file_mounts)) — it is the simplest and
 gives per-target isolation, with the payload written onto the shared workdir for the job to read.
+
+> **Contrast with SLURM.** Because the LSF backend identity-mounts the shared-FS roots (`/proj`,
+> `/opt/share`) into every container, a `shared_workdir` under one of them is automatically visible to
+> containerized steps — no extra configuration. The SkyPilot **SLURM** backend does *not* do this; there
+> a containerized step needs the SkyPilot `workdir` set to an ancestor of `shared_workdir` to get the
+> per-run workdir mounted into the container (see
+> [skypilot-slurm.md](skypilot-slurm.md#workdir-containerized-steps)). On LSF the `workdir` under
+> `cloud_config.lsf.cluster_configs.<cluster>` need not be an ancestor of `shared_workdir` for this
+> reason.
 
 > **Implementation note.** SkyPilot's backend normally sudo-symlink-wraps every absolute,
 > non-`~/`/non-`/tmp/` destination, which fails on the sudo-less login node and would redirect the
