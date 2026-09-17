@@ -277,7 +277,7 @@ class GbserverSource:
                                 import io
                                 import zipfile
 
-                                from gbserver.utils.archive import check_zip_safe
+                                from gbcommon.utils.archive_safety import check_zip_safe
 
                                 zip_bytes = base64.b64decode(archive)
                                 with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
@@ -376,7 +376,7 @@ class GbserverSource:
                         if isinstance(archive, (bytes, bytearray))
                         else archive.encode()
                     )
-                    from gbserver.utils.archive import check_zip_safe
+                    from gbcommon.utils.archive_safety import check_zip_safe
 
                     zip_bytes = base64.b64decode(raw)
                     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
