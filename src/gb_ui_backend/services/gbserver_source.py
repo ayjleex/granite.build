@@ -46,6 +46,76 @@ def _default_sqlite_url() -> str:
     return f"sqlite+aiosqlite:///{os.path.expanduser('~')}/.llmb/llmb-server.db"
 
 
+def _truncation_warning(rows: Any, limit: int) -> Optional[str]:
+    """Warn when a page came back exactly full, i.e. the window was truncated.
+
+    The query is ``ORDER BY <last activity> DESC LIMIT :limit`` with no
+    limit-hit detection, so on a busy deployment a *wider* window can surface
+    *less* history: it keeps the newest `limit` builds and drops precisely the
+    old entries the user widened the window to find, while the UI goes on
+    claiming the full range. Silently under-reporting is worse than saying so.
+
+    A page that is exactly full may or may not have more behind it; the warning
+    is deliberately phrased as "may".
+    """
+    if limit and len(rows) >= limit:
+        return (
+            f"Only the {limit} most recently active builds in this window were "
+            f"scanned, so older entries may be missing. Narrow the window, or "
+            f"wait for the materialised dataset index."
+        )
+    return None
+
+
+def _yaml_from_archive_b64(archive: Any) -> Optional[str]:
+    """Extract a build.yaml from a base64-encoded ZIP. Pure CPU, no I/O.
+
+    Module-level and synchronous on purpose: base64-decoding and unzipping one
+    archive per build is the expensive part of a DP scan, and doing it inline in
+    the coroutine blocked the event loop for the whole scan -- stalling every
+    other request the sidecar was serving, not just this one. Callers hand the
+    whole loop to a worker thread.
+    """
+    import base64
+    import io
+    import zipfile
+
+    from gbserver.utils.archive import check_zip_safe
+
+    try:
+        raw = archive if isinstance(archive, (bytes, bytearray)) else archive.encode()
+        zip_bytes = base64.b64decode(raw)
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            check_zip_safe(zf)
+            names = zf.namelist()
+            # Prefer build.yaml; fall back to the first YAML present.
+            target = next(
+                (n for n in names if n.lower() in ("build.yaml", "build.yml")),
+                next((n for n in names if n.endswith((".yaml", ".yml"))), None),
+            )
+            if target:
+                return zf.read(target).decode("utf-8", errors="replace")
+    except Exception:
+        return None
+    return None
+
+
+def _yaml_from_json_blob(json_blob: Any) -> Optional[str]:
+    """Extract a build.yaml from gbserver's ``json`` column. Pure CPU, no I/O.
+
+    Same reasoning as _yaml_from_archive_b64: the archive lives inside the JSON
+    blob on deployments whose gb_builds has no build_archive column.
+    """
+    import json as _json
+
+    try:
+        blob = _json.loads(json_blob) if isinstance(json_blob, str) else json_blob
+        archive = blob.get("build_archive") if isinstance(blob, dict) else None
+    except Exception:
+        return None
+    return _yaml_from_archive_b64(archive) if archive else None
+
+
 class GbserverSource:
     """
     Async read-only client for gbserver's database.
@@ -155,76 +225,6 @@ class GbserverSource:
                 }
             )
         return builds
-
-
-def _truncation_warning(rows: Any, limit: int) -> Optional[str]:
-    """Warn when a page came back exactly full, i.e. the window was truncated.
-
-    The query is ``ORDER BY <last activity> DESC LIMIT :limit`` with no
-    limit-hit detection, so on a busy deployment a *wider* window can surface
-    *less* history: it keeps the newest `limit` builds and drops precisely the
-    old entries the user widened the window to find, while the UI goes on
-    claiming the full range. Silently under-reporting is worse than saying so.
-
-    A page that is exactly full may or may not have more behind it; the warning
-    is deliberately phrased as "may".
-    """
-    if limit and len(rows) >= limit:
-        return (
-            f"Only the {limit} most recently active builds in this window were "
-            f"scanned, so older entries may be missing. Narrow the window, or "
-            f"wait for the materialised dataset index."
-        )
-    return None
-
-
-def _yaml_from_archive_b64(archive: Any) -> Optional[str]:
-    """Extract a build.yaml from a base64-encoded ZIP. Pure CPU, no I/O.
-
-    Module-level and synchronous on purpose: base64-decoding and unzipping one
-    archive per build is the expensive part of a DP scan, and doing it inline in
-    the coroutine blocked the event loop for the whole scan -- stalling every
-    other request the sidecar was serving, not just this one. Callers hand the
-    whole loop to a worker thread.
-    """
-    import base64
-    import io
-    import zipfile
-
-    from gbserver.utils.archive import check_zip_safe
-
-    try:
-        raw = archive if isinstance(archive, (bytes, bytearray)) else archive.encode()
-        zip_bytes = base64.b64decode(raw)
-        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-            check_zip_safe(zf)
-            names = zf.namelist()
-            # Prefer build.yaml; fall back to the first YAML present.
-            target = next(
-                (n for n in names if n.lower() in ("build.yaml", "build.yml")),
-                next((n for n in names if n.endswith((".yaml", ".yml"))), None),
-            )
-            if target:
-                return zf.read(target).decode("utf-8", errors="replace")
-    except Exception:
-        return None
-    return None
-
-
-def _yaml_from_json_blob(json_blob: Any) -> Optional[str]:
-    """Extract a build.yaml from gbserver's ``json`` column. Pure CPU, no I/O.
-
-    Same reasoning as _yaml_from_archive_b64: the archive lives inside the JSON
-    blob on deployments whose gb_builds has no build_archive column.
-    """
-    import json as _json
-
-    try:
-        blob = _json.loads(json_blob) if isinstance(json_blob, str) else json_blob
-        archive = blob.get("build_archive") if isinstance(blob, dict) else None
-    except Exception:
-        return None
-    return _yaml_from_archive_b64(archive) if archive else None
 
     async def list_builds_for_dp_scan(
         self,
