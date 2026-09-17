@@ -29,6 +29,26 @@ from gb_ui_backend.services.gbserver_source import get_gbserver_source
 
 logger = logging.getLogger(__name__)
 
+# Longest window the Data Processing page may ask for.
+#
+# Raised from 30 so the page can reach back past a quarter: the pipelines users
+# need to find are mostly old, and 30 days made them unreachable regardless of
+# how fast the scan was.
+#
+# 180 rather than 365 because the scan has no index -- the markers it filters on
+# live inside a base64-encoded ZIP in gb_builds, so every build in the window is
+# fetched and decoded. Measured against a production database, per rolling window:
+# 1,365 builds in 90 days, 4,813 in 180, 22,154 in 365. The CPU cost is negligible
+# at any of those (~0.02ms per build), but a year means transferring ~250MB per
+# request and is over the scan's 10,000-row cap twice over, silently dropping
+# precisely the oldest builds the wider window was opened to find. 180 days sits at
+# about half the cap; on this distribution it starts to bite near 300 days.
+#
+# If this is raised further, raise `limit` in _scan_datasets_async too and check
+# the truncation warning still fires -- that warning is the only thing standing
+# between a capped window and a page that under-reports without saying so.
+_MAX_WINDOW_DAYS = 180
+
 _cos_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="cos-io")
 
 # User-added COS scan prefixes (in-memory, not persisted)
@@ -387,7 +407,7 @@ def _build_lineage_graph(datasets: list[dict]) -> dict:
 
 
 @router.get("/lineage")
-async def get_lineage(days: int = Query(1, ge=1, le=30)) -> JSONResponse:
+async def get_lineage(days: int = Query(1, ge=1, le=_MAX_WINDOW_DAYS)) -> JSONResponse:
     """Return lineage DAG (nodes + edges + datasets) from recent DP builds."""
     datasets, scanned, matched, warning = await _scan_datasets_async(days)
     graph = _build_lineage_graph(datasets)
@@ -405,7 +425,9 @@ async def get_lineage(days: int = Query(1, ge=1, le=30)) -> JSONResponse:
 
 
 @router.get("/recent-datasets")
-async def recent_datasets(days: int = Query(1, ge=1, le=30)) -> JSONResponse:
+async def recent_datasets(
+    days: int = Query(1, ge=1, le=_MAX_WINDOW_DAYS)
+) -> JSONResponse:
     """Scan recent builds and return data processing datasets."""
     datasets, scanned, matched, warning = await _scan_datasets_async(days)
     resp: dict[str, Any] = {
