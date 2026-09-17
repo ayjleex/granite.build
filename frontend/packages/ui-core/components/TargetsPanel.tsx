@@ -4,7 +4,13 @@ import { useState } from "react";
 import type { CSSProperties } from "react";
 import { useQuery, useQueries } from "@tanstack/react-query";
 import Link from "next/link";
-import { Button, InlineNotification, Modal, SkeletonText } from "@carbon/react";
+import {
+  Button,
+  InlineNotification,
+  Layer,
+  Modal,
+  SkeletonText,
+} from "@carbon/react";
 import { Document } from "@carbon/icons-react";
 import { BuildStatusBadge } from "./BuildStatusBadge";
 import { useRoutes } from "../config/routes";
@@ -72,21 +78,28 @@ function StepLogModal({
         />
       )}
       {data != null && (
-        <pre
-          style={{
-            background: "var(--cds-layer)",
-            padding: "1rem",
-            overflowX: "auto",
-            margin: 0,
-            fontFamily: "IBM Plex Mono, monospace",
-            fontSize: "0.75rem",
-            lineHeight: "1.5",
-            whiteSpace: "pre-wrap",
-            wordBreak: "break-all",
-          }}
-        >
-          {data}
-        </pre>
+        // <Layer> so `--cds-layer` below resolves to layer-02 rather than
+        // layer-01, which is #ffffff in the g10 theme this app uses. Dropping the
+        // old `var(--cds-layer, #f4f4f4)` fallback alone changed nothing: Carbon
+        // always defines the token, so the fallback never applied and the surface
+        // was already white. The wrapper is what actually recesses it.
+        <Layer>
+          <pre
+            style={{
+              background: "var(--cds-layer)",
+              padding: "1rem",
+              overflowX: "auto",
+              margin: 0,
+              fontFamily: "IBM Plex Mono, monospace",
+              fontSize: "0.75rem",
+              lineHeight: "1.5",
+              whiteSpace: "pre-wrap",
+              wordBreak: "break-all",
+            }}
+          >
+            {data}
+          </pre>
+        </Layer>
       )}
     </Modal>
   );
