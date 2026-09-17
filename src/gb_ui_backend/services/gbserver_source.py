@@ -80,7 +80,7 @@ def _yaml_from_archive_b64(archive: Any) -> Optional[str]:
     import io
     import zipfile
 
-    from gbserver.utils.archive import check_zip_safe
+    from gbcommon.utils.archive_safety import check_zip_safe
 
     try:
         raw = archive if isinstance(archive, (bytes, bytearray)) else archive.encode()
