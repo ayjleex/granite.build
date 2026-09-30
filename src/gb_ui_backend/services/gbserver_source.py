@@ -61,8 +61,8 @@ def _truncation_warning(rows: Any, limit: int) -> Optional[str]:
     if limit and len(rows) >= limit:
         return (
             f"Only the {limit} most recently active builds in this window were "
-            f"scanned, so older entries may be missing. Narrow the window, or "
-            f"wait for the materialised dataset index."
+            f"scanned, so older entries may be missing. Narrow the window to see "
+            f"a complete range."
         )
     return None
 
@@ -253,7 +253,9 @@ class GbserverSource:
                    build_archive
             FROM gb_builds
             WHERE created_time >= :since OR updated_time >= :since
-            ORDER BY CASE WHEN created_time > updated_time THEN created_time ELSE updated_time END DESC
+            ORDER BY CASE WHEN COALESCE(updated_time, created_time) > created_time
+                     THEN COALESCE(updated_time, created_time)
+                     ELSE created_time END DESC
             LIMIT :limit
         """)
         has_archive_column = True
@@ -309,7 +311,9 @@ class GbserverSource:
                            "json"
                     FROM gb_builds
                     WHERE created_time >= :since OR updated_time >= :since
-                    ORDER BY CASE WHEN created_time > updated_time THEN created_time ELSE updated_time END DESC
+                    ORDER BY CASE WHEN COALESCE(updated_time, created_time) > created_time
+                     THEN COALESCE(updated_time, created_time)
+                     ELSE created_time END DESC
                     LIMIT :limit
                 """)
                 async with self._sessions() as session:
@@ -357,7 +361,9 @@ class GbserverSource:
                 SELECT uuid, name, space_name, username, status, created_time, updated_time
                 FROM gb_builds
                 WHERE created_time >= :since OR updated_time >= :since
-                ORDER BY CASE WHEN created_time > updated_time THEN created_time ELSE updated_time END DESC
+                ORDER BY CASE WHEN COALESCE(updated_time, created_time) > created_time
+                     THEN COALESCE(updated_time, created_time)
+                     ELSE created_time END DESC
                 LIMIT :limit
             """)
             async with self._sessions() as session:
