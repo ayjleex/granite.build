@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { Theme } from "@carbon/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useTheme } from "../hooks/useTheme";
+import { type AppRoutes, RoutesProvider, useRoutes } from "../config/routes";
 import { AppHeader } from "./AppHeader";
 import { ChatWidget } from "./ChatWidget";
 
@@ -21,20 +22,29 @@ const queryClient = new QueryClient({
 // matching the convention BuildDetailPageClient/ArtifactDetailPageClient expect
 // (a query param, not a hash, so useSearchParams() picks it up reactively even
 // when navigating between two instances of the same "_" route).
+//
+// The *targets* go through the route seam rather than being spelled out here.
+// They were byte-identical to the two builders in config/routeShapes.ts, which
+// meant ui-core held two independent copies of the same URL shape while claiming
+// one — so a consumer that injected its own scheme still got redirected to the
+// standalone one by this hook. The regexes stay standalone-specific on purpose:
+// they describe the paths gbserver's SPA fallback serves, and a consumer with real
+// path-segment routes simply never matches, which is the correct no-op for it.
 function useDeepLinkRedirect() {
   const router = useRouter();
+  const routes = useRoutes();
   useEffect(() => {
     const path = window.location.pathname;
     const buildMatch = path.match(/^\/dashboard\/builds\/([^/]+)\/?$/);
     if (buildMatch && buildMatch[1] !== "_") {
-      router.replace(`/dashboard/builds/_/?id=${buildMatch[1]}`);
+      router.replace(routes.buildHref(buildMatch[1]));
       return;
     }
     const artifactMatch = path.match(/^\/dashboard\/artifacts\/([^/]+)\/?$/);
     if (artifactMatch && artifactMatch[1] !== "_") {
-      router.replace(`/dashboard/artifacts/_/?id=${artifactMatch[1]}`);
+      router.replace(routes.artifactHref(artifactMatch[1]));
     }
-  }, [router]);
+  }, [router, routes]);
 }
 
 function AppShell({ children }: { children: React.ReactNode }) {
@@ -54,10 +64,27 @@ function AppShell({ children }: { children: React.ReactNode }) {
   );
 }
 
-export function ClientShell({ children }: { children: React.ReactNode }) {
-  return (
+/**
+ * The shared app root: query client, theme, header, chat widget.
+ *
+ * `routes` is the injection point for the link-shape seam. It has to be here
+ * because this is the only root ui-core owns — a consumer wrapping ClientShell
+ * from outside would sit above the provider but below nothing, leaving every
+ * ui-core component inside it (including useDeepLinkRedirect above) reading the
+ * standalone default. Omitting it keeps that default, which is what the
+ * standalone app wants.
+ */
+export function ClientShell({
+  children,
+  routes,
+}: {
+  children: React.ReactNode;
+  routes?: AppRoutes;
+}) {
+  const shell = (
     <QueryClientProvider client={queryClient}>
       <AppShell>{children}</AppShell>
     </QueryClientProvider>
   );
+  return routes ? <RoutesProvider value={routes}>{shell}</RoutesProvider> : shell;
 }

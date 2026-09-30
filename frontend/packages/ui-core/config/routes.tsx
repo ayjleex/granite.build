@@ -1,48 +1,28 @@
 'use client'
 
 import React from 'react'
+import { type AppRoutes, DEFAULT_ROUTES } from './routeShapes'
 
-/**
- * Where shared components should link for builds and artifacts.
- *
- * ui-core is consumed by more than one app, and those apps do not agree on URL
- * shape: this repo's standalone app serves a single detail shell per resource
- * and passes the id as a query param (`/dashboard/builds/_/?id=…`), while the
- * internal gb-ui deployment uses path segments (`/builds/:id`). Components that
- * hardcoded the former could not be shared at all — which is why gb-ui keeps
- * local copies of BuildsTable and several detail panels that are otherwise
- * identical to the ones here.
- *
- * Injecting the link shape instead removes that reason to fork. Consumers that
- * say nothing keep the standalone scheme, so adding this changes no behaviour.
- */
-export interface AppRoutes {
-  /** Detail page for one build. */
-  buildHref(buildId: string): string
-  /** Detail page for one artifact. */
-  artifactHref(artifactId: string): string
-}
-
-/**
- * The standalone app's scheme, and the fallback when no provider is mounted.
- *
- * Keeping this as the default is deliberate: it means introducing the seam is a
- * no-op for every existing call site, and a consumer opts in by mounting a
- * provider rather than by being migrated.
- */
-export const DEFAULT_ROUTES: AppRoutes = {
-  buildHref: (buildId) => `/dashboard/builds/_/?id=${buildId}`,
-  artifactHref: (artifactId) => `/dashboard/artifacts/_/?id=${artifactId}`,
-}
+// Re-exported so `config/routes` remains the single import path for consumers,
+// while the pure builders stay importable from a module without 'use client'.
+// See routeShapes.ts for why the split exists.
+export { DEFAULT_ROUTES } from './routeShapes'
+export type { AppRoutes } from './routeShapes'
 
 const RoutesContext = React.createContext<AppRoutes>(DEFAULT_ROUTES)
 
 /**
  * Override the link shape for everything below. Mount once, near the root.
  *
- * `value` is memoised by the caller or, more usually, a module-level constant —
- * an object literal written inline here would be a new reference every render
- * and would re-render every consumer.
+ * `value` does not need memoising by the caller: an object literal written inline
+ * would be a new reference every render, so the provider memoises on the two
+ * builders it actually contains. `AppRoutes` is a stateless bag of pure
+ * functions, which is what makes that safe — there is no state to go stale, and
+ * a caller passing a module-level constant pays nothing for the check.
+ *
+ * The previous version documented this as the caller's obligation instead. That
+ * failed silently when ignored: every consumer re-rendered on every parent
+ * render, which is a perf cliff rather than an error, so nothing surfaced it.
  */
 export function RoutesProvider({
   value,
@@ -51,13 +31,22 @@ export function RoutesProvider({
   value: AppRoutes
   children: React.ReactNode
 }) {
-  return <RoutesContext.Provider value={value}>{children}</RoutesContext.Provider>
+  const memoised = React.useMemo<AppRoutes>(
+    () => value,
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [value.buildHref, value.artifactHref],
+  )
+  return <RoutesContext.Provider value={memoised}>{children}</RoutesContext.Provider>
 }
 
 /**
  * Read the active route builders. Returns {@link DEFAULT_ROUTES} when no
  * provider is mounted, so this is safe to call from any shared component
  * without requiring consumers to change.
+ *
+ * No warning is emitted when the default is in effect, deliberately: the
+ * standalone app mounts no provider by design, so warning on it would fire
+ * constantly in the primary consumer and train people to ignore the message.
  */
 export function useRoutes(): AppRoutes {
   return React.useContext(RoutesContext)
