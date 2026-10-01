@@ -77,6 +77,45 @@ describe('DEFAULT_ROUTES', () => {
   })
 })
 
+describe('the deep-link redirect decodes before it re-encodes', () => {
+  // Review found the two halves disagreeing: `window.location.pathname` is
+  // already percent-encoded and the builders encode again, so feeding a raw
+  // segment to a builder double-encodes it and the id arrives wrong at the
+  // consumer. Static, because ClientShell.tsx is 'use client' React and this
+  // harness has no DOM or transpiler — but the decode is the whole fix, so its
+  // absence is what needs to fail.
+  const src = read('components/ClientShell.tsx')
+
+  function redirectCalls() {
+    return src.match(/routes\.(?:build|artifact)Href\([^)]*\)/g) || []
+  }
+
+  it('passes both matched segments through a decode', () => {
+    const calls = redirectCalls()
+    assert.equal(calls.length, 2, `expected 2 redirect builder calls, found ${calls.length}`)
+    for (const call of calls) {
+      assert.match(
+        call,
+        /decode/,
+        `${call} passes the raw pathname segment to a builder that encodes it — ` +
+          'the id double-encodes and reads back wrong',
+      )
+    }
+  })
+
+  it('round-trips an id with a reserved character', () => {
+    // What the fixed pair must produce: decode the segment, let the builder
+    // encode it once, and `searchParams.get('id')` returns the original.
+    const routes = defaultRoutes()
+    for (const id of ['a b', 'a&b=c', 'x#y', 'a+b']) {
+      const segment = encodeURIComponent(id)
+      const href = routes.buildHref(decodeURIComponent(segment))
+      const got = new URLSearchParams(href.split('?')[1]).get('id')
+      assert.equal(got, id, `id ${JSON.stringify(id)} did not survive the round trip`)
+    }
+  })
+})
+
 describe('the seam is the only place ui-core spells these URLs', () => {
   // Every ui-core source file, minus the one module allowed to contain the
   // literal shape. A second copy is not a style problem: it silently ignores a

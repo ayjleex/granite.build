@@ -30,6 +30,24 @@ const queryClient = new QueryClient({
 // standalone one by this hook. The regexes stay standalone-specific on purpose:
 // they describe the paths gbserver's SPA fallback serves, and a consumer with real
 // path-segment routes simply never matches, which is the correct no-op for it.
+//
+// The matched segment is decoded before it reaches a builder. `pathname` is
+// percent-encoded and the builders encode again, so passing it through raw
+// double-encodes: `/dashboard/builds/a%20b` would redirect to `?id=a%2520b`,
+// which `searchParams.get('id')` reads back as the literal `a%20b` — the wrong
+// id. UUIDs are unaffected, but ids carrying a reserved character are exactly
+// the ones the encoding was added for, so the two halves have to agree.
+function decodeSegment(segment: string): string {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    // A stray `%` is not a valid escape and makes decodeURIComponent throw.
+    // Redirecting with the raw segment is wrong in the same way it was before
+    // this fix; throwing out of an effect would blank the whole shell.
+    return segment;
+  }
+}
+
 function useDeepLinkRedirect() {
   const router = useRouter();
   const routes = useRoutes();
@@ -37,12 +55,12 @@ function useDeepLinkRedirect() {
     const path = window.location.pathname;
     const buildMatch = path.match(/^\/dashboard\/builds\/([^/]+)\/?$/);
     if (buildMatch && buildMatch[1] !== "_") {
-      router.replace(routes.buildHref(buildMatch[1]));
+      router.replace(routes.buildHref(decodeSegment(buildMatch[1])));
       return;
     }
     const artifactMatch = path.match(/^\/dashboard\/artifacts\/([^/]+)\/?$/);
     if (artifactMatch && artifactMatch[1] !== "_") {
-      router.replace(routes.artifactHref(artifactMatch[1]));
+      router.replace(routes.artifactHref(decodeSegment(artifactMatch[1])));
     }
   }, [router, routes]);
 }

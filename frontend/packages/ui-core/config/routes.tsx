@@ -14,15 +14,23 @@ const RoutesContext = React.createContext<AppRoutes>(DEFAULT_ROUTES)
 /**
  * Override the link shape for everything below. Mount once, near the root.
  *
- * `value` does not need memoising by the caller: an object literal written inline
- * would be a new reference every render, so the provider memoises on the two
- * builders it actually contains. `AppRoutes` is a stateless bag of pure
- * functions, which is what makes that safe — there is no state to go stale, and
- * a caller passing a module-level constant pays nothing for the check.
+ * `value` does not need memoising by the caller, including in the form that
+ * matters: `<ClientShell routes={{ buildHref: (id) => …, artifactHref: (id) => … }}>`
+ * creates two new functions on every render. The context value published here is
+ * stable regardless — it is built once and delegates through a ref, so a new
+ * `value` changes which builders get called without changing the identity every
+ * `useRoutes()` consumer depends on.
  *
- * The previous version documented this as the caller's obligation instead. That
- * failed silently when ignored: every consumer re-rendered on every parent
- * render, which is a perf cliff rather than an error, so nothing surfaced it.
+ * An earlier version memoised on `[value.buildHref, value.artifactHref]`, which
+ * reads like it covers this and does not: those are the identities that change.
+ * The version before that documented stability as the caller's obligation. Both
+ * failed the same way — every consumer re-rendering on every parent render, a
+ * perf cliff rather than an error, so nothing surfaced it.
+ *
+ * Delegating is safe here specifically because `AppRoutes` is a stateless bag of
+ * pure functions: there is no stale closure to capture, and the newest builder is
+ * always the one invoked. The ref is written during render rather than in an
+ * effect so that the first render already calls the builders it was given.
  */
 export function RoutesProvider({
   value,
@@ -31,12 +39,16 @@ export function RoutesProvider({
   value: AppRoutes
   children: React.ReactNode
 }) {
-  const memoised = React.useMemo<AppRoutes>(
-    () => value,
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [value.buildHref, value.artifactHref],
+  const latest = React.useRef(value)
+  latest.current = value
+  const stable = React.useMemo<AppRoutes>(
+    () => ({
+      buildHref: (buildId) => latest.current.buildHref(buildId),
+      artifactHref: (artifactId) => latest.current.artifactHref(artifactId),
+    }),
+    [],
   )
-  return <RoutesContext.Provider value={memoised}>{children}</RoutesContext.Provider>
+  return <RoutesContext.Provider value={stable}>{children}</RoutesContext.Provider>
 }
 
 /**
