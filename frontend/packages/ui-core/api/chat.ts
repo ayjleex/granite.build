@@ -3,9 +3,7 @@
  * Deliberately not using the shared axios client for streaming — axios
  * doesn't stream cleanly in-browser — so this uses native fetch + ReadableStream.
  */
-import axios from 'axios'
-
-import { apiBase } from './client'
+import { apiBase, createApiClient, resolveApiHeaders } from './client'
 import { parseSSEStream } from '../lib/sse'
 
 export type ChatEventType =
@@ -28,7 +26,10 @@ export interface ChatEvent {
   confirmation_id?: string
 }
 
-const statusClient = axios.create({ baseURL: apiBase('/api/analytics') })
+// Covers /chat/status, /chat/stop and /chat/confirm. /chat/stream cannot go
+// through an interceptor because it uses native fetch, so it spreads
+// resolveApiHeaders() itself below — the one path that has to remember.
+const statusClient = createApiClient(apiBase('/api/analytics'))
 
 export interface ChatStatus {
   enabled: boolean
@@ -118,7 +119,12 @@ export async function* streamChat(
 ): AsyncGenerator<ChatEvent> {
   const res = await fetch(apiBase('/api/analytics/chat/stream'), {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      ...(await resolveApiHeaders()),
+      // Set last on purpose: the body below is always JSON, so a host provider
+      // must not be able to change how the server reads it.
+      'Content-Type': 'application/json',
+    },
     body: JSON.stringify({
       session_id: sessionId,
       message,

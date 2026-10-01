@@ -3,8 +3,8 @@
  * gbserver itself at the same origin — no separate URL config needed.
  * All calls return null gracefully when analytics is not configured.
  */
-import axios, { AxiosError } from 'axios'
-import { apiBase } from './client'
+import { AxiosError } from 'axios'
+import { apiBase, createApiClient } from './client'
 import type {
   BuildStatusChartPoint,
   FailureTrendResponse,
@@ -12,7 +12,12 @@ import type {
   AIAnalysis,
 } from '../types'
 
-const client = axios.create({ baseURL: apiBase('/api/analytics') })
+// Shares the host seam with every other ui-core client. Not cosmetic here: the
+// saved failure-trend routes are guarded by Depends(get_current_author), which
+// resolves through the same resolve_identity() chat uses, so without host headers
+// saved-trend ownership collapses to one shared author and users can list,
+// overwrite and delete each other's saved analyses.
+const client = createApiClient(apiBase('/api/analytics'))
 
 // Wraps calls so they return null instead of throwing when analytics is unavailable
 async function safeGet<T>(path: string, params?: Record<string, unknown>): Promise<T | null> {
