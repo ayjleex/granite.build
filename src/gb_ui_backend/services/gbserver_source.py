@@ -234,9 +234,10 @@ class GbserverSource:
         """Return (builds_with_yaml, warning_or_None) for data processing path scanning.
 
         Reads build_archive (base64-encoded ZIP) and extracts the YAML in a worker
-        thread, via the module-level `_decode_*_rows` helpers. Falls back to
-        returning builds without YAML if the column doesn't exist, so the caller
-        can report the gap rather than silently returning nothing.
+        thread (`asyncio.to_thread`), via the nested `_decode_*_rows` helpers and the
+        module-level `_yaml_from_*` decoders. Falls back to returning builds without
+        YAML if the column doesn't exist, so the caller can report the gap rather
+        than silently returning nothing.
         """
         since = datetime.now(timezone.utc) - timedelta(days=days_back)
         params = {"since": since, "limit": limit}
