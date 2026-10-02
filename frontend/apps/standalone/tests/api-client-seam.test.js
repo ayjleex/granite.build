@@ -6,12 +6,9 @@
  *
  * ui-core had four module-private `axios.create()` instances — gbserver, analytics,
  * chat and dataProcessing — none of which a host app's own interceptor can reach.
- * That matters beyond configuration: `analytics.ts`'s saved failure-trend routes and
- * `chat.ts`'s session scoping are both guarded server-side by `resolve_identity()`,
- * which falls back to one shared identity when no per-user headers arrive. So an
- * unreached client does not fail loudly, it silently merges every user into one
- * bucket — saved analyses other users can overwrite, and `confirm_action` proposals
- * one user can resolve on another's behalf.
+ * An unreached client does not fail loudly: identity-scoped routes fall back to one
+ * shared identity, silently merging every user into one bucket. See
+ * `ApiClientOverrides` in api/client.ts for the detail.
  *
  * `createApiClient()` in api/client.ts is the single seam. The checks here are the
  * two things that go wrong:
@@ -76,28 +73,46 @@ describe('every ui-core API client goes through the seam', () => {
     assert.ok(read('api/client.ts').length > 500, 'api/client.ts unexpectedly small — wrong file?')
   })
 
-  it('calls axios.create() exactly once, inside the factory', () => {
+  it('gives only client.ts the ability to construct an axios instance', () => {
+    // Checked by import, not by call shape. An earlier version of this test
+    // matched `const x = axios.create(` at the start of a line, which a client
+    // written as `export const x = axios.create(` walks straight past. A module
+    // that cannot name the default axios binding cannot construct an instance at
+    // all, however the call is written. A named import is fine: analytics.ts
+    // takes `{ AxiosError }` only, for instanceof checks.
+    const defaultAxiosImport =
+      /^\s*import\s+(?!type\b)(?!\{)[A-Za-z_$][\w$]*\s*(?:,\s*\{[^}]*\})?\s*from\s*['"]axios['"]/m
     const offenders = []
     for (const entry of fs.readdirSync(API_DIR)) {
-      if (!entry.endsWith('.ts')) continue
-      const src = fs.readFileSync(path.join(API_DIR, entry), 'utf8')
-      // Ignore prose: only count it where it is actually invoked.
-      const calls = (src.match(/^\s*(?:const|let)\s+\w+\s*=\s*axios\.create\(/gm) || []).length
-      if (calls > 0 && entry !== 'client.ts') offenders.push(`${entry} (${calls})`)
+      if (!entry.endsWith('.ts') || entry === 'client.ts') continue
+      if (defaultAxiosImport.test(fs.readFileSync(path.join(API_DIR, entry), 'utf8'))) {
+        offenders.push(entry)
+      }
     }
     assert.deepEqual(
       offenders,
       [],
-      'these clients bypass createApiClient(), so no host override reaches them:\n  ' +
+      'these modules import axios directly and could build a client that no host ' +
+        'override reaches; route them through createApiClient():\n  ' +
         offenders.join('\n  '),
     )
   })
 
+  it('calls axios.create() exactly once in client.ts', () => {
+    // The companion to the check above, and the half the old test name claimed
+    // but never did: it counted calls outside client.ts and never inside it, so
+    // a second instance added next to the factory passed.
+    const src = read('api/client.ts')
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/^[^\n'"`]*\/\/.*$/gm, '')
+    const calls = (src.match(/axios\.create\(/g) || []).length
+    assert.equal(calls, 1, `expected one axios.create() in api/client.ts, found ${calls}`)
+  })
+
   it('lets only the gbserver client take the host base URL', () => {
     // Headers and the 401 hook are shared because identity is needed everywhere.
-    // The base URL is not: a host's replacement is a gbserver path (gb-ui returns
-    // `/api/v1-env/{env}`), so applying it to analytics or dataProcessing rewrites
-    // `/api/analytics/…` and 404s every request. The default is the safe
+    // The base URL is not: a replacement pointing at a different gbserver would
+    // rewrite `/api/analytics/…` and 404 every request. The default is the safe
     // direction, and this asserts nothing has quietly opted in.
     const optedIn = []
     for (const entry of fs.readdirSync(API_DIR)) {
@@ -112,18 +127,25 @@ describe('every ui-core API client goes through the seam', () => {
     )
   })
 
-  it('wires all four clients through createApiClient', () => {
+  it('wires all four clients through createApiClient, on their own paths', () => {
     for (const [file, base] of [
-      ['api/gbserver.ts', "'/api/v1'"],
-      ['api/analytics.ts', "'/api/analytics'"],
-      ['api/chat.ts', "'/api/analytics'"],
-      ['api/dataProcessing.ts', "'/api/analytics/data-processing'"],
+      ['api/gbserver.ts', '/api/v1'],
+      ['api/analytics.ts', '/api/analytics'],
+      ['api/chat.ts', '/api/analytics'],
+      ['api/dataProcessing.ts', '/api/analytics/data-processing'],
     ]) {
-      const src = read(file)
+      // The path is asserted, not just mentioned in the failure message. Without
+      // it this only restated the previous check, and a client silently moved to
+      // another base URL still passed.
+      const expected = new RegExp(
+        'createApiClient\\(\\s*apiBase\\(\\s*[\'"]' +
+          base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') +
+          '[\'"]\\s*\\)',
+      )
       assert.match(
-        src,
-        /createApiClient\(apiBase\(/,
-        `${file} does not build its client with createApiClient(apiBase(${base}))`,
+        read(file),
+        expected,
+        `${file} does not build its client with createApiClient(apiBase('${base}'))`,
       )
     }
   })
@@ -203,25 +225,35 @@ describe('the streaming path carries headers too', () => {
   // forgetting this is the regression worth catching.
   const src = read('api/chat.ts')
 
-  it('spreads resolveApiHeaders() into the fetch headers', () => {
+  it('builds its fetch headers from resolveApiHeaders()', () => {
     assert.match(
       src,
-      /headers: \{\s*\.\.\.\(await resolveApiHeaders\(\)\)/,
-      'the /chat/stream fetch does not spread resolveApiHeaders() into its headers, so it ' +
+      /new Headers\(await resolveApiHeaders\(\)\)/,
+      'the /chat/stream fetch does not seed its headers from resolveApiHeaders(), so it ' +
         'arrives unidentified however the host is configured',
     )
   })
 
-  it('keeps Content-Type authoritative over the provider', () => {
+  it('keeps Content-Type authoritative over the provider, in any casing', () => {
     // A provider returning its own Content-Type must not change how the JSON body
-    // is read, so the literal has to come after the spread rather than before it.
-    const spreadAt = src.indexOf('...(await resolveApiHeaders())')
-    const contentTypeAt = src.indexOf("'Content-Type': 'application/json'", spreadAt)
-    assert.notEqual(spreadAt, -1, 'no resolveApiHeaders() spread found in chat.ts')
-    assert.notEqual(contentTypeAt, -1, "no Content-Type literal after the spread")
-    assert.ok(
-      spreadAt < contentTypeAt,
-      'Content-Type must be set after the provider spread, not before it',
+    // is read, so it is set after the provider's headers are in.
+    const seedAt = src.indexOf('new Headers(await resolveApiHeaders())')
+    assert.notEqual(seedAt, -1, 'no resolveApiHeaders() seed found in chat.ts')
+    const setAt = src.indexOf(".set('Content-Type', 'application/json')", seedAt)
+    assert.notEqual(setAt, -1, 'no Content-Type set() after the provider headers')
+    assert.ok(seedAt < setAt, 'Content-Type must be set after the provider headers, not before')
+
+    // And it must go through Headers.set, which is case-insensitive. An object
+    // literal keyed 'Content-Type' does not overwrite a provider's lowercase
+    // 'content-type': both survive as distinct keys and fetch joins them into
+    // one comma-separated value, which the server reads from the front. So
+    // ordering alone is not enough, and a literal here is the regression.
+    assert.doesNotMatch(
+      src,
+      /headers:\s*\{\s*\.\.\.\(await resolveApiHeaders\(\)\)/,
+      'chat.ts spreads the provider into an object literal — a lowercase ' +
+        "'content-type' from a provider would survive alongside 'Content-Type'; " +
+        'seed a Headers object and call .set() instead',
     )
   })
 

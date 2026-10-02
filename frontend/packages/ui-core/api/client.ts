@@ -39,13 +39,11 @@ export function apiBase(path: string): string {
  * **This is deliberately one seam for all four clients, not one per client.** The
  * problem is not specific to any of them: `gbserver`, `analytics`, `chat` and
  * `dataProcessing` are each a module-private `axios.create()` that no host
- * interceptor can reach, and more than one of them scopes by identity on the
- * server side. `analytics.ts`'s saved failure-trend routes are guarded by
- * `Depends(get_current_author)`, which resolves through the same
- * `resolve_identity()` that chat uses — so in a header-authenticated deployment
- * saved-trend ownership collapses to a single shared author exactly as chat's
- * session scoping does. A per-client hook would have to be rediscovered and
- * rebuilt for each one.
+ * interceptor can reach, and more than one scopes by identity server-side — both
+ * chat's session scoping and `analytics`'s saved failure-trend ownership resolve
+ * through `resolve_identity()`, so both collapse to one shared identity when
+ * requests arrive unidentified. A per-client hook would have to be rediscovered
+ * and rebuilt for each one.
  *
  * Every hook is called **per request**, not once at configure time, because both
  * the token and the active environment can change while the app is running.
@@ -56,15 +54,9 @@ export interface ApiClientOverrides {
    *
    * Headers and the 401 hook are shared by every client, because identity is
    * needed everywhere. Base URL is not, and sharing it would be a bug: the four
-   * clients sit on different paths, and a host's replacement is written for one of
-   * them. gb-ui returns `/api/v1-env/{env}` so the environment switcher can point
-   * at a different gbserver — applying that to `analytics` or `dataProcessing`
-   * would rewrite `/api/analytics/…` to a gbserver path and 404 every request.
-   *
-   * It is also only *meaningful* for gbserver. gb-ui serves `/api/analytics/*`
-   * from its own sidecar through a single `next.config.ts` rewrite, with no
-   * per-environment variant — switching environments changes which gbserver
-   * database that sidecar reads, not where the sidecar lives.
+   * clients sit on different paths, so a replacement written to point at a
+   * different gbserver would rewrite `/api/analytics/…` to a gbserver path and
+   * 404 every request.
    *
    * So clients opt in via `allowHostBaseUrl`, and only gbserver does. The default
    * is the safe direction: a new client added later ignores this hook unless its
@@ -91,7 +83,7 @@ export interface ApiClientOverrides {
 
 /**
  * Previous name for {@link ApiClientOverrides}, from when the seam covered only
- * the gbserver client. Kept because gb-ui installs through it.
+ * the gbserver client. Kept so existing hosts keep compiling.
  */
 export type GbserverClientOverrides = ApiClientOverrides
 

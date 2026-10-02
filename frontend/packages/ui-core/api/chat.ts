@@ -117,14 +117,18 @@ export async function* streamChat(
   pageContext?: ChatPageContext,
   signal?: AbortSignal,
 ): AsyncGenerator<ChatEvent> {
+  // A Headers object, not an object literal, because header names are
+  // case-insensitive but object keys are not: a provider returning
+  // `content-type` would leave a literal holding both that and
+  // `Content-Type`, and fetch would combine them into one comma-joined
+  // value that the server reads from the front. Headers.set replaces any
+  // casing, so setting it last is actually last.
+  const headers = new Headers(await resolveApiHeaders())
+  headers.set('Content-Type', 'application/json')
+
   const res = await fetch(apiBase('/api/analytics/chat/stream'), {
     method: 'POST',
-    headers: {
-      ...(await resolveApiHeaders()),
-      // Set last on purpose: the body below is always JSON, so a host provider
-      // must not be able to change how the server reads it.
-      'Content-Type': 'application/json',
-    },
+    headers,
     body: JSON.stringify({
       session_id: sessionId,
       message,

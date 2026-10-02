@@ -28,10 +28,8 @@ import type {
 // see client.ts. getBuildStepLog below is the call site that depends on the
 // scoping: it passes `baseURL: ''` so gbserver's log_path is used verbatim.
 //
-// This is the only client that opts into `resolveBaseUrl`. A host's replacement
-// base is a gbserver path (gb-ui returns `/api/v1-env/{env}` for its environment
-// switcher), so applying it to the analytics or dataProcessing clients would
-// rewrite `/api/analytics/…` and 404.
+// This is the only client that opts into `resolveBaseUrl` — see
+// `allowHostBaseUrl` in client.ts for why that is per-client rather than shared.
 const client = createApiClient(apiBase('/api/v1'), { allowHostBaseUrl: true })
 
 // ── Response adapters ─────────────────────────────────────────────────────────

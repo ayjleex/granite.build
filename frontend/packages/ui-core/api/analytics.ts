@@ -1,5 +1,5 @@
 /**
- * API client for the gb-ui analytics routes (/api/analytics/*), served by
+ * API client for the analytics routes (/api/analytics/*), served by
  * gbserver itself at the same origin — no separate URL config needed.
  * All calls return null gracefully when analytics is not configured.
  */
@@ -13,10 +13,9 @@ import type {
 } from '../types'
 
 // Shares the host seam with every other ui-core client. Not cosmetic here: the
-// saved failure-trend routes are guarded by Depends(get_current_author), which
-// resolves through the same resolve_identity() chat uses, so without host headers
-// saved-trend ownership collapses to one shared author and users can list,
-// overwrite and delete each other's saved analyses.
+// saved failure-trend routes are identity-scoped server-side, so unidentified
+// requests collapse their ownership to one shared author. See ApiClientOverrides
+// in client.ts.
 const client = createApiClient(apiBase('/api/analytics'))
 
 // Wraps calls so they return null instead of throwing when analytics is unavailable
