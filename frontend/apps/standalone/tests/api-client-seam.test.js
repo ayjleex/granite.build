@@ -39,6 +39,20 @@ function read(rel) {
   return fs.readFileSync(path.join(UI_CORE_ROOT, rel), 'utf8')
 }
 
+/** Every .ts/.tsx file in the package, skipping build and dependency output. */
+function tsFilesUnder(dir) {
+  const out = []
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (entry.name === 'node_modules' || entry.name === 'dist' || entry.name.startsWith('.')) {
+      continue
+    }
+    const full = path.join(dir, entry.name)
+    if (entry.isDirectory()) out.push(...tsFilesUnder(full))
+    else if (/\.tsx?$/.test(entry.name)) out.push(full)
+  }
+  return out
+}
+
 /**
  * The source of the balanced (...) argument list following `marker`.
  *
@@ -80,20 +94,40 @@ describe('every ui-core API client goes through the seam', () => {
     // that cannot name the default axios binding cannot construct an instance at
     // all, however the call is written. A named import is fine: analytics.ts
     // takes `{ AxiosError }` only, for instanceof checks.
-    const defaultAxiosImport =
-      /^\s*import\s+(?!type\b)(?!\{)[A-Za-z_$][\w$]*\s*(?:,\s*\{[^}]*\})?\s*from\s*['"]axios['"]/m
+    //
+    // Four ways a module can get its hands on a constructor, all covered: a
+    // default import, a namespace import, `{ default as … }`, and the named
+    // `Axios` class via `new Axios(...)`. The whole package is scanned, not just
+    // api/ — nothing outside it touches axios today, which is the point worth
+    // keeping true.
     const offenders = []
-    for (const entry of fs.readdirSync(API_DIR)) {
-      if (!entry.endsWith('.ts') || entry === 'client.ts') continue
-      if (defaultAxiosImport.test(fs.readFileSync(path.join(API_DIR, entry), 'utf8'))) {
-        offenders.push(entry)
+    for (const file of tsFilesUnder(UI_CORE_ROOT)) {
+      const rel = path.relative(UI_CORE_ROOT, file)
+      if (rel === path.join('api', 'client.ts')) continue
+      const src = fs.readFileSync(file, 'utf8')
+
+      for (const [, clause] of src.matchAll(
+        /\bimport\s+([\s\S]*?)\s+from\s*['"]axios['"]/g,
+      )) {
+        const c = clause.trim()
+        const named = c.match(/^\{([\s\S]*)\}$/)
+        if (named) {
+          // `{ AxiosError }` is fine — a type/value import that constructs
+          // nothing. `{ default as x }` is a default import wearing a disguise.
+          if (/\bdefault\s+as\b/.test(named[1])) offenders.push(`${rel} (default as)`)
+          continue
+        }
+        if (c.startsWith('*')) offenders.push(`${rel} (namespace import)`)
+        else if (/^(?!type\b)[A-Za-z_$][\w$]*/.test(c)) offenders.push(`${rel} (default import)`)
       }
+
+      if (/\bnew\s+Axios\s*\(/.test(src)) offenders.push(`${rel} (new Axios())`)
     }
     assert.deepEqual(
       offenders,
       [],
-      'these modules import axios directly and could build a client that no host ' +
-        'override reaches; route them through createApiClient():\n  ' +
+      'these modules can construct an axios instance that no host override ' +
+        'reaches; route them through createApiClient():\n  ' +
         offenders.join('\n  '),
     )
   })
@@ -102,9 +136,18 @@ describe('every ui-core API client goes through the seam', () => {
     // The companion to the check above, and the half the old test name claimed
     // but never did: it counted calls outside client.ts and never inside it, so
     // a second instance added next to the factory passed.
+    // Comments are stripped so the prose mentions of `axios.create()` in the
+    // TSDoc are not counted. Line comments are cut at the `//` rather than
+    // taking the whole line with them: a trailing comment on the real call
+    // would otherwise drop it and report zero.
     const src = read('api/client.ts')
       .replace(/\/\*[\s\S]*?\*\//g, '')
-      .replace(/^[^\n'"`]*\/\/.*$/gm, '')
+      .split('\n')
+      .map((line) => {
+        const at = line.indexOf('//')
+        return at === -1 ? line : line.slice(0, at)
+      })
+      .join('\n')
     const calls = (src.match(/axios\.create\(/g) || []).length
     assert.equal(calls, 1, `expected one axios.create() in api/client.ts, found ${calls}`)
   })
