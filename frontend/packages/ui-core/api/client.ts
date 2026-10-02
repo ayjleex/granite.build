@@ -150,6 +150,13 @@ type OwnedConfig = { [OWNED_REQUEST]?: boolean }
 /**
  * An axios instance wired to the host overrides above.
  *
+ * **Every ui-core API client must be built here, not with `axios.create()`.** An
+ * instance made directly gets none of the wiring below, so a host's headers and
+ * its 401 hook never reach it — and that failure is silent: the requests still go
+ * out, they just arrive unidentified. This is the one rule to carry over when
+ * adding a client. It is a convention rather than something the tests enforce;
+ * a source scan cannot tell reliably whether a module can reach a constructor.
+ *
  * Replaces four hand-rolled `axios.create()` calls that each had to remember the
  * same wiring, and only one of which ever had it. Anything a promoted component
  * reaches for has to be injectable or promoting it is a silent regression; this
@@ -164,9 +171,9 @@ type OwnedConfig = { [OWNED_REQUEST]?: boolean }
  * origin, so the token would be disclosed there and can make a presigned
  * object-store URL reject the request for carrying a second auth mechanism.
  *
- * `allowHostBaseUrl` opts a client into `resolveBaseUrl`. Only gbserver sets it —
- * see that field's docs for why sharing it across clients would 404 the other
- * three.
+ * `allowHostBaseUrl` opts a client into `resolveBaseUrl`. **Only gbserver passes
+ * it**, and a new client should not without a reason — see that field's docs for
+ * why sharing it across clients would 404 the other three.
  */
 export function createApiClient(
   baseURL: string,
