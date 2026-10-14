@@ -302,6 +302,17 @@ quick-tests:
 extended-tests-setup:
 	$(MAKE) g4os-skypilot-venv
 	$(MAKE) slurm-setup
+	@# Best-effort: without a container runtime/openssl or a free port, the
+	@# local-PostgreSQL storage tests skip instead of blocking every extended test.
+	$(MAKE) postgres-setup || echo "WARNING: postgres-setup failed; the local-PostgreSQL storage tests will skip."
+
+# Stops what extended-tests-setup started.
+.PHONY: extended-tests-teardown
+extended-tests-teardown:
+	@# "-": run every teardown even if one fails, so the postgres container and its
+	@# password-bearing env file never outlive a failed slurm-teardown.
+	-$(MAKE) slurm-teardown
+	-$(MAKE) postgres-teardown
 
 # For now we mock the HF calls since we can't provide the HF_TOKEN as a git secret on forked PRs.
 # GBTEST_STANDALONE_ENVIRONMENT (which HF resource group a STANDALONE push targets)
@@ -462,6 +473,19 @@ slurm-setup:
 slurm-teardown:
 	source .venv/bin/activate;\
 	bash scripts/slurm/teardown-slurm.sh
+
+# Local TLS-enabled PostgreSQL for the standalone SQL storage tests
+# (test/unit/storage/postgres). Setup writes the GBSERVER_SQL_* connection env to
+# .cache/gbtest-postgres/postgres.env, which libgbtest/local_postgres.py loads in
+# GB_ENVIRONMENT=STANDALONE test runs (extended-tests sets that).
+
+.PHONY: postgres-setup
+postgres-setup:
+	bash scripts/postgres/setup-postgres.sh
+
+.PHONY: postgres-teardown
+postgres-teardown:
+	bash scripts/postgres/teardown-postgres.sh
 
 # Local S3-compatible store (SeaweedFS) for the SLURM demo's artifact push.
 # Demo-only — keep out of CI setup targets (Docker Hub anonymous rate limit).
