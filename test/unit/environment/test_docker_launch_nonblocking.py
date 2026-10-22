@@ -24,7 +24,8 @@ standalone docker e2e tests never completing).
 
 This test makes ``containers.run`` block on a threading.Event and asserts that
 ``launch_docker`` is still pending after a short wait — which is only possible if
-the blocking call was offloaded — and that it really ran on another thread.
+the blocking call was offloaded — and that, once released, it completes and
+records the container.
 
 Two things it deliberately does *not* do, both of which made it flaky before:
 
@@ -34,33 +35,40 @@ Two things it deliberately does *not* do, both of which made it flaky before:
   never runs at all and any later "did it start?" assertion fails for a reason
   that has nothing to do with the event loop.
 * It does not treat the short wait as a deadline for the worker thread to start.
-  ``launch_docker`` submits to the default executor (``run_in_executor(None,
-  ...)``), which is shared process-wide and only ``min(32, cpu_count + 4)``
-  threads wide — 8 on a 4-core CI runner against 18 on a typical dev machine. A
-  loaded suite can keep the submission queued well past any short timeout, so
-  sampling the start flag once made a green run depend on how busy that queue was.
+  The default executor is created lazily per event loop, so ``launch_docker``'s
+  own submissions are the only work on it — but on a loaded CI runner, thread
+  startup and CPU contention can still delay the call well past any short
+  timeout, so sampling the start flag once made a green run depend on how busy
+  the machine was.
+
+Any exception ``launch_docker`` raises is re-raised as-is rather than being
+reported as one of the timing failures above.
 """
 
 import asyncio
+import contextlib
 import threading
-import time
 from unittest.mock import MagicMock
 
 import pytest
 
 from gbserver.environment.docker import Docker
 
+LAUNCH_ID = "launchid123"
+CONTAINER_ID = "container-123"
+
 # How long the loop is given to come back to us. Only needs to be long enough to
-# show the loop is not frozen; it is not a budget for the executor queue.
+# show the loop is not frozen; it is not a budget for the worker thread.
 LOOP_ALIVE_SECONDS = 0.3
 
-# How long the executor may keep the submission queued before we call it broken.
-# Generous on purpose; pytest-timeout (1200s) is the backstop.
+# How long the worker thread may take to start the call, and later to finish it
+# once released, before we call it broken. Generous on purpose; pytest-timeout
+# (1200s) is the backstop.
 OFFLOAD_WAIT_SECONDS = 60
 
-# How long the fake docker call pretends to hang. Only has to outlast the wait
-# above, and kept short because a regressed offload parks the loop inside it —
-# so this is also how long a failing run takes.
+# How long the fake docker call pretends to hang. Only has to outlast the
+# LOOP_ALIVE_SECONDS wait, and kept short because a regressed offload parks the
+# loop inside it — so this is also how long a failing run takes.
 HANG_SECONDS = 5
 
 
@@ -88,65 +96,112 @@ def _make_docker_env(client: MagicMock) -> Docker:
     return env
 
 
-@pytest.mark.asyncio
-async def test_launch_docker_does_not_block_event_loop():
-    """A blocking containers.run must not freeze the loop, and must run off it."""
-    release = threading.Event()
-    started = threading.Event()
-    loop_thread = threading.get_ident()
-    call_threads: list[int] = []
+def _start_launch(env: Docker) -> asyncio.Task:
+    """Schedule ``env.launch_docker`` with minimal arguments.
 
-    def blocking_run(*args, **kwargs):
-        # Simulate a slow/stalled daemon or inline image pull.
-        call_threads.append(threading.get_ident())
-        started.set()
-        release.wait(timeout=HANG_SECONDS)
-        container = MagicMock()
-        container.id = "container-123"
-        return container
+    Args:
+        env: Docker environment from ``_make_docker_env``.
 
-    client = MagicMock()
-    client.containers.run.side_effect = blocking_run
-    env = _make_docker_env(client)
-
-    task = asyncio.ensure_future(
+    Returns:
+        The running launch task.
+    """
+    return asyncio.create_task(
         env.launch_docker(
-            launch_id="launchid123",
+            launch_id=LAUNCH_ID,
             config={},
             launcher_config={"command": "echo hi"},
             step={"name": "s"},
             run_metadata={"target_name": "t"},
         )
     )
+
+
+def _raise_if_failed(task: asyncio.Task) -> None:
+    """Re-raise the task's own exception, if it has already finished with one.
+
+    Called before each timing assertion so a real error in launch_docker
+    surfaces with its traceback instead of being misreported as a timing failure.
+
+    Args:
+        task: The launch task.
+    """
+    if task.done():
+        task.result()
+
+
+async def _await_started(
+    started: asyncio.Future, task: asyncio.Task, timeout: float
+) -> None:
+    """Wait until containers.run is invoked, or until the launch task finishes.
+
+    Args:
+        started: Future that the fake ``containers.run`` resolves on entry.
+        task: The launch task; if it finishes first, its exception is re-raised.
+        timeout: Upper bound on the wait, in seconds.
+    """
+    await asyncio.wait(
+        {started, task}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
+    )
+    _raise_if_failed(task)
+    assert started.done(), f"containers.run was never invoked within {timeout}s"
+
+
+async def _cancel_if_pending(task: asyncio.Task) -> None:
+    """Cancel the task if a failed assertion left it running.
+
+    Args:
+        task: The launch task.
+    """
+    if not task.done():
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+@pytest.mark.asyncio
+async def test_launch_docker_does_not_block_event_loop():
+    """A blocking containers.run must not freeze the loop, and must run off it."""
+    loop = asyncio.get_running_loop()
+    started = loop.create_future()
+    release = threading.Event()
+
+    def blocking_run(*args, **kwargs):
+        # Simulate a slow/stalled daemon or inline image pull.
+        loop.call_soon_threadsafe(started.set_result, None)
+        release.wait(timeout=HANG_SECONDS)
+        container = MagicMock()
+        container.id = CONTAINER_ID
+        return container
+
+    client = MagicMock()
+    client.containers.run.side_effect = blocking_run
+    env = _make_docker_env(client)
+
+    task = _start_launch(env)
     try:
         # asyncio.wait returns on timeout without cancelling, so the executor
         # submission survives and can still run. If launch_docker blocked the
         # loop, control would not come back here until blocking_run returned and
         # the task would be done.
         done, _ = await asyncio.wait({task}, timeout=LOOP_ALIVE_SECONDS)
+        _raise_if_failed(task)
         assert task not in done, (
             "launch_docker completed within "
             f"{LOOP_ALIVE_SECONDS}s while containers.run was still blocked — it "
             "ran the blocking call on the event loop"
         )
 
-        # Now wait for the offload itself, which may sit queued behind a busy
-        # default executor for far longer than the wait above.
-        deadline = time.monotonic() + OFFLOAD_WAIT_SECONDS
-        while not started.is_set() and time.monotonic() < deadline:
-            await asyncio.sleep(0.05)
-        assert (
-            started.is_set()
-        ), f"containers.run was never invoked within {OFFLOAD_WAIT_SECONDS}s"
+        # Now wait for the offload itself, which can take far longer than the
+        # wait above on a loaded machine.
+        await _await_started(started, task, OFFLOAD_WAIT_SECONDS)
 
-        # And it ran somewhere other than the event loop. This states the property
-        # directly rather than inferring it from timing.
-        assert call_threads[0] != loop_thread, (
-            "containers.run ran on the event-loop thread — launch_docker did not "
-            "offload it"
-        )
+        # Let the call return and the launch finish; wait_for is right here
+        # because the task is expected to complete, and it propagates anything
+        # the post-run bookkeeping raises.
+        release.set()
+        await asyncio.wait_for(task, timeout=OFFLOAD_WAIT_SECONDS)
+        assert env._launched_containers == {LAUNCH_ID: CONTAINER_ID}
     finally:
         # Release the worker thread so it does not linger after the test.
         release.set()
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        await _cancel_if_pending(task)
