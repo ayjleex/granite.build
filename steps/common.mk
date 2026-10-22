@@ -42,6 +42,13 @@
 #                no-op default so there is no "overriding recipe" warning. A step
 #                with test infrastructure sets this and delegates to the repo-root
 #                Makefile, e.g.  test-setup:  $(MAKE) -C $(REPO_ROOT) slurm-setup
+#   STEP_PUBLISHABLE  (optional, default `true`) set to `false` for a step that must
+#                never be promoted into the committed assets tree (e.g. an exemplar
+#                kept only as a template). `publish-step` runs only when the value is
+#                exactly `true`; any other value (`false`, `False`, `no`, `0`, empty)
+#                makes it refuse. `space`, `image` and `test` are unaffected. Use
+#                `override STEP_PUBLISHABLE := false` so a command-line or environment
+#                value cannot re-enable it.
 #
 # Whether a step builds a custom image is auto-detected: if a Dockerfile sits
 # next to the including Makefile, `image`/`publish-image` are real and the
@@ -75,7 +82,7 @@
 # ---- Required / defaulted inputs -------------------------------------------
 
 ifndef STEP_NAME
-$(error STEP_NAME must be set by the including Makefile before 'include ../../common.mk')
+$(error STEP_NAME must be set by the including Makefile before its 'include .../common.mk' line)
 endif
 
 # A step builds a custom image iff a Dockerfile is present next to its Makefile.
@@ -131,8 +138,12 @@ endif
 # steps/$(STEP_PATH)/step.yaml and the bundled src/. Overridable on the command
 # line or in the including Makefile.
 SPACE_DIR  ?= space
-# `name:` written into the generated space.yaml. Defaults to the step name.
-SPACE_NAME ?= $(STEP_NAME)
+# `name:` written into the generated space.yaml. Defaults to `public`, the name of
+# the shared configurations/spaces/local that Mode-2 tests resolve through, because
+# an hf:// push derives its HF Enterprise resource group from the space name
+# (gbspace-<space>[-<env>]): a space named after the step would look for a
+# gbspace-<step> group that does not exist. Override it to push to another group.
+SPACE_NAME ?= public
 # When non-empty, a variables.DEFAULT_ENVIRONMENT entry is written into the
 # generated space.yaml (e.g. DEFAULT_ENVIRONMENT=skypilot/slurm). Empty by
 # default — builds that set environment_uri explicitly do not need it.
@@ -229,6 +240,11 @@ PUBLISH_STEP_DIR ?= $(ASSETS_DIR)/environments/$(STEP_ENV)/steps/$(STEP_PATH)
 # matches the top-level convention (test/<path> mirrors test-data/<path>).
 PUBLISH_TEST_DIR     ?= $(REPO_ROOT)/test/steps/$(STEP_PATH)/$(STEP_ENV)
 PUBLISH_TESTDATA_DIR ?= $(REPO_ROOT)/test-data/steps/$(STEP_PATH)/$(STEP_ENV)
+# The three trees publish-step writes, as one list for the guards and checks that
+# walk them. Recursive (=) so a command-line override of any of the three (as the
+# check-published re-render passes) is honored. An empty member drops out of the
+# list, which guard-publish-paths detects by counting.
+PUBLISH_DIRS = $(PUBLISH_STEP_DIR) $(PUBLISH_TEST_DIR) $(PUBLISH_TESTDATA_DIR)
 # space_uri written into each copied buildtest.yaml so the Mode-2 (published) test
 # resolves the step through the shared space configurations/spaces/local (which
 # chains to configurations/assets). It is RELATIVE to the copied file's own dir,
@@ -243,6 +259,18 @@ space := $(empty) $(empty)
 MODE2_PARENTS := test-data steps $(subst /, ,$(STEP_PATH)) $(STEP_ENV) cluster
 MODE2_DOTDOT  := $(subst $(space),,$(foreach s,$(MODE2_PARENTS),../))
 MODE2_SPACE_URI  ?= $(MODE2_DOTDOT)configurations/spaces/local
+# Which buildtest.yaml space_uris publish-step rewrites. LOCAL means a bare path or
+# a file:// URI, as libgbtest's _resolve_space_uri reads them; it is rewritten.
+# REMOTE means any other <scheme>:// URI (git://, git+ssh://, https://, ...) or the
+# scp-like user@host:path form; it is copied unchanged. An ERE can't say "any scheme
+# except file", so file:// lines are rewritten first (FILE_...), then every line
+# not matching REMOTE_... is. Both anchor the URI right after blanks and at most one
+# opening quote, so a local path containing `@`, `:` or `://` (../../a@b:c/space)
+# stays local. The RE is pasted into a single-quoted sed program, so the `'` in the
+# quote class is written as the shell's '"'"'.
+SPACE_URI_VALUE_RE  := ^space_uri:[[:space:]]*["'"'"']?
+FILE_SPACE_URI_RE   := $(SPACE_URI_VALUE_RE)file://
+REMOTE_SPACE_URI_RE := $(SPACE_URI_VALUE_RE)([a-zA-Z][a-zA-Z0-9+.-]*://|[a-zA-Z0-9_][a-zA-Z0-9._-]*@[a-zA-Z0-9.-]+:)
 
 # publish-step refuses to publish a custom-image step until its IMAGE_REF exists on
 # the registry — a step.yaml/build test referencing an unpublished image is broken
@@ -250,6 +278,9 @@ MODE2_SPACE_URI  ?= $(MODE2_DOTDOT)configurations/spaces/local
 # to bypass (offline publish, or the check-published re-render below). No effect on
 # non-image steps, whose IMAGE_REF is empty (see require-image-published).
 PUBLISH_REQUIRE_IMAGE ?= true
+
+# STEP_PUBLISHABLE gates `publish-step` (see the includer variables above).
+STEP_PUBLISHABLE ?= true
 
 .PHONY: all help image publish-image space publish-step check-published test test-setup clean
 
@@ -270,7 +301,7 @@ help:
 	@echo
 	@echo "Targets:"
 	@echo "  space          render step.yaml + a space.yaml into the Space $(SPACE_DIR)/ (offline)"
-	@echo "  publish-step   render the step into the assets tree (+ USAGE.md as README.md) + copy build tests into test/steps/ (not in all; image steps: image must be published first, override with PUBLISH_REQUIRE_IMAGE=false)"
+	@echo "  publish-step   $(if $(filter-out true,$(STEP_PUBLISHABLE)),[DISABLED for this step: STEP_PUBLISHABLE=$(STEP_PUBLISHABLE)] ,)render the step into the assets tree (+ USAGE.md as README.md) + copy build tests into test/steps/ (not in all; image steps: image must be published first, override with PUBLISH_REQUIRE_IMAGE=false)"
 	@echo "  check-published  re-render to a temp dir and diff against the committed artifacts; exit 1 on drift"
 	@echo "  image          build the image from $(DOCKERFILE) for $(PLATFORM)  (no-op when no Dockerfile is present)"
 	@echo "  publish-image  push the image to the registry                 (no-op when no Dockerfile is present)"
@@ -323,23 +354,34 @@ define render-step-template
 	sed "s#\$${IMAGE_REF}#$$ref#g" "$(TEMPLATE)" > "$(1)"
 endef
 
-# write-gbignore — drop a .gbignore next to the published step.yaml so the g.b
-# build process ships the listed files verbatim instead of Jinja-rendering them.
-# The .gbignore is an ADDITIVE glob list (this impl has NO gitignore-style "!"
-# negation — see utils/filesystem.py:_get_matching_ignored_files), so it must
-# enumerate what to SKIP rather than "ignore all but step.yaml": that keeps
-# step.yaml's runtime {{ ... }} rendered while sparing the docs (README.md, which
-# may show {{ ... }} examples) and the whole src/ tree (step scripts/helpers,
-# shipped as-is). The .gbignore is itself a dotfile, so the renderer's glob never
-# picks it up — its own {{ ... }} in the comment is safe. $(1) is the target dir.
-define write-gbignore
-	@printf '%s\n' \
-		'# The following allows the docs to contain {{ ... }} but be ignored by the g.b build process.' \
-		'**/*.md' \
-		'# Ship the src/ tree verbatim — do not jinja-process step scripts/helpers.' \
-		'src/**' \
-		> "$(1)/.gbignore"
-	@echo "[$(STEP_NAME)] wrote $(1)/.gbignore (skip Jinja for docs + src/)"
+# copy-gbignore — copy the step's own .gbignore next to the rendered step.yaml, so
+# the g.b build process ships the listed files verbatim instead of Jinja-rendering
+# them. Every step carries one next to its Makefile (the create-framework-step
+# skill writes it for new steps); common.mk generates nothing, so the file in the
+# step source is exactly what is tested and published. Both `space` (so `make
+# test`) and `publish-step` use this macro, so a step renders the same way when
+# tested and when published. The usual list is `**/*.md` (docs may show {{ ... }}
+# examples) and `src/**` (scripts ship as is). The .gbignore is an ADDITIVE glob
+# list (no gitignore-style "!" negation; see
+# utils/filesystem.py:_get_matching_ignored_files), so it names what to SKIP
+# rather than "ignore all but step.yaml". It is a dotfile, so the renderer's glob
+# never picks it up itself. $(1) is the target dir.
+define copy-gbignore
+	@cp .gbignore "$(1)/.gbignore"
+	@echo "[$(STEP_NAME)] copied .gbignore to $(1)/"
+endef
+
+# require-gbignore — fail before anything is written when the step has no
+# .gbignore. Shipping a step without one would Jinja-render its docs and scripts,
+# which fails silently on a cluster rather than here.
+define require-gbignore
+	@test -f .gbignore || { \
+		echo "[$(STEP_NAME)] ERROR: no .gbignore next to this Makefile." >&2; \
+		echo "[$(STEP_NAME)] Add one listing the files to ship without Jinja rendering, usually:" >&2; \
+		echo "[$(STEP_NAME)]   **/*.md" >&2; \
+		echo "[$(STEP_NAME)]   src/**" >&2; \
+		echo "[$(STEP_NAME)] (see steps/README.md, .gbignore)." >&2; \
+		exit 1; }
 endef
 
 # guard-publish-paths — fail fast before `publish-step` runs any rm -rf. The publish
@@ -352,12 +394,24 @@ define guard-publish-paths
 	@test -n "$(strip $(STEP_NAME))" || { echo "[publish-step] refusing: STEP_NAME is empty"; exit 1; }
 	@test -n "$(strip $(STEP_PATH))" || { echo "[publish-step] refusing: STEP_PATH is empty"; exit 1; }
 	@test -n "$(strip $(STEP_ENV))"  || { echo "[publish-step] refusing: STEP_ENV is empty"; exit 1; }
-	@for d in "$(PUBLISH_STEP_DIR)" "$(PUBLISH_TEST_DIR)" "$(PUBLISH_TESTDATA_DIR)"; do \
+	@test $(words $(PUBLISH_DIRS)) -eq 3 || { echo "[publish-step] refusing: a publish path is empty ($(PUBLISH_DIRS))"; exit 1; }
+	@for d in $(PUBLISH_DIRS); do \
 		case "$$d" in \
-			"" | "/" | "$(REPO_ROOT)" | "$(REPO_ROOT)/") \
+			"/" | "$(REPO_ROOT)" | "$(REPO_ROOT)/") \
 				echo "[publish-step] refusing: publish path resolves to '$$d' (too broad to rm -rf)"; exit 1;; \
 		esac; \
 	done
+endef
+
+# require-publishable — fail publish-step before it writes anything when the step has
+# opted out of publishing, so an exemplar/template step can never land in the committed
+# assets tree. It fails closed: only the exact value `true` publishes, so a typo or a
+# variant spelling (`False`, `no`, `0`) blocks rather than slipping through.
+define require-publishable
+	@if [ "$(STEP_PUBLISHABLE)" != "true" ]; then \
+		echo "[publish-step] refusing: step '$(STEP_NAME)' is not publishable (STEP_PUBLISHABLE='$(STEP_PUBLISHABLE)'; only 'true' publishes)."; \
+		exit 1; \
+	fi
 endef
 
 # require-image-published — for custom-image steps, fail publish-step unless the step's
@@ -389,7 +443,7 @@ endef
 
 # Render a self-contained Space into $(SPACE_DIR)/:
 #   $(SPACE_DIR)/steps/$(STEP_PATH)/step.yaml   (+ bundled src/)
-#   $(SPACE_DIR)/steps/$(STEP_PATH)/.gbignore   (skip Jinja for **/*.md + src/)
+#   $(SPACE_DIR)/steps/$(STEP_PATH)/.gbignore   (the step's own, copied)
 #   $(SPACE_DIR)/space.yaml                       (base_uris -> $(SPACE_BASE_URI))
 # step-template.yaml is rendered substituting ONLY ${IMAGE_REF} so runtime Jinja
 # ({{ ... }}) and shell expansions (${VAR}, $(cmd)) in the run/setup blocks pass
@@ -399,6 +453,7 @@ endef
 # slash-free STEP_NAME) is used for the steps/ tree so a nested step's identity is
 # preserved locally exactly as it will be once published.
 space:
+	$(call require-gbignore)
 	@mkdir -p $(SPACE_DIR)/steps/$(STEP_PATH)
 	$(call render-step-template,$(SPACE_DIR)/steps/$(STEP_PATH)/step.yaml)
 	@if [ -d "$(SRC_DIR)" ] && [ -n "$$(ls -A $(SRC_DIR) 2>/dev/null)" ]; then \
@@ -406,7 +461,7 @@ space:
 		cp -R "$(SRC_DIR)" "$(SPACE_DIR)/steps/$(STEP_PATH)/$(SRC_DIR)"; \
 		echo "[$(STEP_NAME)] bundled $(SRC_DIR)/ into $(SPACE_DIR)/steps/$(STEP_PATH)/"; \
 	fi
-	$(call write-gbignore,$(SPACE_DIR)/steps/$(STEP_PATH))
+	$(call copy-gbignore,$(SPACE_DIR)/steps/$(STEP_PATH))
 	@printf 'name: %s\nsecret_manager:\n  type: local\n  config: {}\nbase_uris:\n  - %s\n' \
 		"$(SPACE_NAME)" "$(SPACE_BASE_URI)" > $(SPACE_DIR)/space.yaml
 	@if [ -n "$(DEFAULT_ENVIRONMENT)" ]; then \
@@ -420,15 +475,15 @@ space:
 # the repo's parallel top-level test/ <-> test-data/ trees:
 #   $(PUBLISH_STEP_DIR)/step.yaml               (+ bundled src/)   — the published step
 #   $(PUBLISH_STEP_DIR)/README.md               (from USAGE.md)    — user-facing usage doc
-#   $(PUBLISH_STEP_DIR)/.gbignore                                  — skip Jinja for **/*.md + src/
+#   $(PUBLISH_STEP_DIR)/.gbignore                                  — the step's own, copied
 #   $(PUBLISH_TEST_DIR)/<cluster>/              — per-cluster build tests (copied)
 #   $(PUBLISH_TESTDATA_DIR)/<cluster>/          — their fixtures, with space_uri rewritten
 #
 # The step's own README.md (development-oriented) is NOT published; only USAGE.md is,
 # renamed to README.md so a user browsing the released assets tree finds usage docs.
-# A .gbignore is written beside step.yaml so the g.b build process ships the docs
-# (**/*.md) and the src/ tree verbatim instead of Jinja-rendering them — docs may
-# contain {{ ... }} examples and src scripts must not be templated (see write-gbignore).
+# The step's .gbignore is copied beside step.yaml so the g.b build process ships the
+# files it lists (usually the docs and src/) verbatim instead of Jinja-rendering
+# them (see copy-gbignore). A step without one is refused (require-gbignore).
 #
 # The step's own `test/<cluster>/` nesting is flattened on copy (the inner `test`
 # segment is dropped) so the published test lands at test/steps/<path>/<env>/<cluster>/
@@ -445,9 +500,14 @@ space:
 # itself are intentionally NOT copied; those stay Mode-1 only (run via `make
 # test`). The copied buildtest.yaml files have their space_uri rewritten to
 # $(MODE2_SPACE_URI) so the Mode-2 tests resolve the PUBLISHED step via
-# configurations/spaces/local instead of the local space/. Deliberately NOT part
+# configurations/spaces/local instead of the local space/. Only LOCAL space_uris
+# are rewritten. A REMOTE one (see REMOTE_SPACE_URI_RE, e.g. the IBM
+# git+ssh://github.ibm.com space used by tests marked `ibm`) is copied unchanged:
+# it already resolves the step from that remote space in both modes. Deliberately NOT part
 # of `all`: publish-step writes the committed assets tree.
 publish-step:
+	$(call require-publishable)
+	$(call require-gbignore)
 	$(call require-image-published)
 	$(call guard-publish-paths)
 	@mkdir -p $(PUBLISH_STEP_DIR)
@@ -462,7 +522,7 @@ publish-step:
 	else \
 		echo "[$(STEP_NAME)] WARNING: no USAGE.md to publish as README.md"; \
 	fi
-	$(call write-gbignore,$(PUBLISH_STEP_DIR))
+	$(call copy-gbignore,$(PUBLISH_STEP_DIR))
 	@rm -rf "$(PUBLISH_TEST_DIR)" "$(PUBLISH_TESTDATA_DIR)"
 	@mkdir -p "$(PUBLISH_TEST_DIR)" "$(PUBLISH_TESTDATA_DIR)"
 	@copied=0; for d in $(TEST_DIR)/*/; do \
@@ -481,7 +541,10 @@ publish-step:
 	@find "$(PUBLISH_STEP_DIR)" "$(PUBLISH_TEST_DIR)" "$(PUBLISH_TESTDATA_DIR)" \
 		-name __pycache__ -type d -prune -exec rm -rf {} +
 	@find "$(PUBLISH_TESTDATA_DIR)" -name buildtest.yaml -exec \
-		sed -i.bak 's#^space_uri:.*#space_uri: $(MODE2_SPACE_URI)#' {} \; -exec rm -f {}.bak \;
+		sed -E -i.bak \
+			-e '\#$(FILE_SPACE_URI_RE)#s#^space_uri:.*#space_uri: $(MODE2_SPACE_URI)#' \
+			-e '\#$(REMOTE_SPACE_URI_RE)#!s#^space_uri:.*#space_uri: $(MODE2_SPACE_URI)#' \
+			{} \; -exec rm -f {}.bak \;
 	@echo "[$(STEP_NAME)] published step -> $(PUBLISH_STEP_DIR)"
 	@echo "[$(STEP_NAME)] copied build tests -> $(PUBLISH_TEST_DIR)"
 	@echo "[$(STEP_NAME)] copied fixtures   -> $(PUBLISH_TESTDATA_DIR) (space_uri -> $(MODE2_SPACE_URI))"
@@ -497,29 +560,102 @@ publish-step:
 # reference already committed (extracted from the published step.yaml via
 # IMAGE_REF), so only genuine content drift — an edited template/src/test that
 # was never re-published — is reported, not the per-commit IMAGE_TAG churn (see
-# the eval README's "tag coupling" note). It also passes PUBLISH_REQUIRE_IMAGE=false to
+# the "keep the published image tag and your local build in sync" note under "Two
+# test modes" in steps/README.md). It also passes PUBLISH_REQUIRE_IMAGE=false to
 # the re-render so drift-checking stays offline (it never queries the registry — the
-# image-existence guard applies only to a real `make publish-step`). Exit 0 = in sync
-# (or nothing published yet); exit 1 = drift, so re-run `make publish-step` and commit it.
+# image-existence guard applies only to a real `make publish-step`). It succeeds when the
+# committed trees are in sync, or when none of the three published locations exists
+# (nothing published yet). Otherwise it fails, and the first line says why: DRIFT
+# (re-run `make publish-step` and commit it), STALE or ERROR (below). Go by that
+# message, not the exit status: make exits 2 whenever a recipe fails, so a caller
+# cannot tell the three cases apart by status.
+#
+# Two failures are reported as themselves rather than as drift. Both used to surface as
+# "every file drifted, re-run publish-step": the re-render's output went to /dev/null,
+# so a failed render left the temp trees empty and the diff blamed the committed files.
+#   * STALE — the step is not publishable (STEP_PUBLISHABLE is not `true`) yet a
+#     published copy is still committed in ANY of the three locations (a leftover
+#     test/steps/ copy counts, even after the assets copy is deleted). Re-publishing
+#     is impossible (publish-step refuses), so the fix is to remove the copies (or
+#     make the step publishable again).
+#   * ERROR — any other publish-step failure. Its captured output is printed and the
+#     check stops instead of diffing against a half-written temp tree.
+#
+# A MISSING side is compared against an empty directory, not /dev/null. Git cannot hold an
+# empty directory, so a step with no per-cluster build tests has no committed test/steps/
+# or test-data/steps/ tree at all — while `publish-step` always mkdir -p's those two. The
+# obvious `diff -r /dev/null <dir>` does not mean "compare against nothing": diff looks for
+# a file named `null` INSIDE the directory, fails to find it, and exits 2. That read as
+# DRIFT for every such step, telling the developer to re-publish artifacts that were already
+# in sync and cannot be committed (measured on distill-logit-precompute, whose test/ has no
+# per-cluster subdir: `diff: .../test/null: No such file or directory` -> DRIFT). An empty
+# scratch dir compares correctly in both directions: silent when both sides are empty, and a
+# real added-files report when only one side has content.
 check-published:
-	@if [ ! -f "$(PUBLISH_STEP_DIR)/step.yaml" ]; then \
-		echo "[$(STEP_NAME)] nothing published at $(PUBLISH_STEP_DIR); nothing to check."; exit 0; \
-	fi; \
-	tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
-	ref=$$(sed -n 's#.*image_id: *"docker:\(.*\)".*#\1#p' "$(PUBLISH_STEP_DIR)/step.yaml" | head -1); \
+	@$(call exit-if-nothing-published); \
+	$(call fail-if-stale); \
+	$(call diff-published)
+
+# The check-published stages below are SHELL FRAGMENTS: each continues the caller's
+# single command (no leading @, `\`-joined), so they share one shell — an `exit` in a
+# stage ends the whole check, and diff-published's $$tmp is visible to
+# rerender-published. The existence tests run in the shell at check time, not via a
+# parse-time $(wildcard), so `make publish-step check-published` sees fresh state.
+
+# exit-if-nothing-published — succeed early when none of the three published
+# locations exists (nothing has been published, so there is nothing to compare).
+define exit-if-nothing-published
+	found=; for d in $(PUBLISH_DIRS); do [ -e "$$d" ] && found=1; done; \
+	[ -n "$$found" ] || { \
+		echo "[$(STEP_NAME)] nothing published at $(PUBLISH_STEP_DIR) (or its test/steps/, test-data/steps/ copies); nothing to check."; \
+		exit 0; \
+	}
+endef
+
+# fail-if-stale — a step that is not publishable must have no committed published
+# copy in any location; list each one that exists and fail (STALE).
+define fail-if-stale
+	[ "$(STEP_PUBLISHABLE)" = "true" ] || { \
+		echo "[$(STEP_NAME)] STALE: step is not publishable (STEP_PUBLISHABLE='$(STEP_PUBLISHABLE)'; only 'true' publishes) but a published copy is committed:"; \
+		for d in $(PUBLISH_DIRS); do [ -e "$$d" ] && echo "  $$d"; done; \
+		echo "[$(STEP_NAME)] remove it with 'git rm -r' on the paths above, or make the step publishable again."; \
+		exit 1; \
+	}
+endef
+
+# rerender-published — re-run publish-step into $$tmp with the committed image ref $$ref,
+# capturing its output; on failure print it as ERROR and exit, so nothing is diffed
+# against a half-written temp tree.
+define rerender-published
 	$(MAKE) --no-print-directory publish-step \
 		PUBLISH_STEP_DIR="$$tmp/step" PUBLISH_TEST_DIR="$$tmp/test" \
 		PUBLISH_TESTDATA_DIR="$$tmp/testdata" PUBLISH_REQUIRE_IMAGE=false \
-		$${ref:+IMAGE_REF="$$ref"} >/dev/null; \
+		$${ref:+IMAGE_REF="$$ref"} >"$$tmp/render.log" 2>&1 || { \
+		echo "[$(STEP_NAME)] ERROR: re-rendering the step failed, so nothing was compared:"; \
+		sed 's/^/  /' "$$tmp/render.log"; \
+		exit 1; \
+	}
+endef
+
+# diff-published — re-render into a temp dir and diff each committed tree against its
+# fresh counterpart (a missing side compares as an empty dir; see the check-published
+# comment above); report OK or DRIFT.
+define diff-published
+	tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
+	empty="$$tmp/.empty"; mkdir -p "$$empty"; \
+	ref=$$(sed -n 's#.*image_id: *"docker:\(.*\)".*#\1#p' "$(PUBLISH_STEP_DIR)/step.yaml" 2>/dev/null | head -1); \
+	$(call rerender-published); \
 	rc=0; \
 	for pair in "$(PUBLISH_STEP_DIR):$$tmp/step" "$(PUBLISH_TEST_DIR):$$tmp/test" "$(PUBLISH_TESTDATA_DIR):$$tmp/testdata"; do \
 		committed=$${pair%:*}; fresh=$${pair##*:}; \
-		[ -e "$$committed" ] || committed=/dev/null; \
+		[ -e "$$committed" ] || committed="$$empty"; \
+		[ -e "$$fresh" ] || fresh="$$empty"; \
 		diff -r -x '__pycache__' -x '*.pyc' "$$committed" "$$fresh" || rc=1; \
 	done; \
 	if [ $$rc = 0 ]; then echo "[$(STEP_NAME)] OK: committed artifacts match current source."; \
 	else echo "[$(STEP_NAME)] DRIFT: re-run 'make publish-step' and commit the regenerated files."; fi; \
 	exit $$rc
+endef
 
 # ---- Tests -----------------------------------------------------------------
 
@@ -543,6 +679,15 @@ check-published:
 # virtualenv ($(VENV_DIR)). This recipe fails fast with a pointer to `make venv`
 # if that venv is absent, then activates it (sourced in the same shell as pytest,
 # since each recipe line is its own shell) before running the tests.
+#
+# pytest does not load the repo's test/conftest.py for tests under steps/, so two
+# variables the repo suites get from there (or from their Makefile targets) are
+# defaulted here, each only when the caller hasn't set it:
+#   * GB_ENVIRONMENT=STANDALONE: unset, gbserver defaults to PROD and the build-test
+#     base refuses to run ("Refusing to run storage tests with GB_ENVIRONMENT=PROD").
+#   * GBTEST_STANDALONE_ENVIRONMENT=STAGING: sends a STANDALONE hf:// push to the
+#     staging resource group, as test/conftest.py does, not the production one.
+# GBTEST_MODE is left alone: libgbtest already defaults it to live.
 test: space image
 	@if [ ! -d "$(TEST_DIR)" ] || [ -z "$$(ls -A $(TEST_DIR) 2>/dev/null)" ]; then \
 		echo "[$(STEP_NAME)] no tests in $(TEST_DIR)/; nothing to run."; \
@@ -555,6 +700,9 @@ test: space image
 	fi; \
 	echo "[$(STEP_NAME)] activating venv $(VENV_DIR)"; \
 	. "$(VENV_DIR)/bin/activate"; \
+	export GB_ENVIRONMENT="$${GB_ENVIRONMENT:-STANDALONE}"; \
+	export GBTEST_STANDALONE_ENVIRONMENT="$${GBTEST_STANDALONE_ENVIRONMENT:-STAGING}"; \
+	echo "[$(STEP_NAME)] GB_ENVIRONMENT=$$GB_ENVIRONMENT GBTEST_STANDALONE_ENVIRONMENT=$$GBTEST_STANDALONE_ENVIRONMENT"; \
 	PYTHONPATH="$(SRC_DIR)$${PYTHONPATH:+:$$PYTHONPATH}" $(PYTHON) -m pytest $(PYTEST_CAPTURE) $(TEST_DIR)
 
 # ---- Optional pre-test setup hook ------------------------------------------

@@ -4,9 +4,12 @@ This is the root of a directory that contains content to generate step
 implementations (`step.yaml` plus assets) suitable for inclusion in a
 Granite.build space.
 
-Subdirectories contain step implementations (`eval`, `byoc`, etc.), each with
-per-compute-environment subdirectories (`skypilot`, `lsf`, `k8s`, ...). For
-example, `steps/eval/skypilot` holds the eval step's SkyPilot implementation.
+Subdirectories contain step implementations (`byoc`, `dpk`, etc.), each with
+per-compute-environment subdirectories (`skypilot`, `lsf`, `k8s`, ...). Related steps
+can be grouped under a category directory (see [Nested steps](#nested-steps)). For
+example, `steps/byoc/skypilot` holds the flat `byoc` step's SkyPilot implementation,
+and `steps/eval/eval-example/skypilot` holds the SkyPilot implementation of the
+`eval-example` step in the `eval` category.
 
 > **Audience:** step *developers* authoring and publishing step implementations.
 > If you are instead *using* steps in a `build.yaml` (referencing, configuring, or
@@ -32,12 +35,14 @@ directly under `configurations/assets/.../steps/*` with no `steps/` source is
 `byoc` is a public-image step and still lives in `steps/`, because the framework
 (templated rendering, the publish pipeline, and the synced Mode-1/Mode-2 test trees —
 see [Two test modes](#two-test-modes)) applies to it just as much as to a
-custom-image step like `eval`.
+custom-image step like `eval-example`.
 
 **The two tiers today.** The repo currently contains both:
 
 * **Sourced steps** — authored under `steps/`, with a *generated* `configurations/`
-  counterpart (today: `byoc`, `eval`).
+  counterpart (today: `byoc`, `dpk`, and the `distill/*` steps). The `eval-example`
+  exemplar is sourced too but deliberately unpublished (`STEP_PUBLISHABLE := false`),
+  so it has no `configurations/` counterpart.
 * **Hand-authored asset steps** — ~30+ step definitions that exist **only** under
   `configurations/assets/.../steps/*` with no `steps/` source (e.g. `digit`, `sage`,
   the `sage-eval-*` / `openinstruct-*` / `bfcl-*` families, `hello`). These predate
@@ -53,7 +58,8 @@ of them).
 out to change a hand-authored step under `configurations/assets/.../steps/*`, prefer
 migrating it into `steps/` first (add a `step-template.yaml` + `Makefile`, move any
 code into `src/`, then let `make publish-step` regenerate the asset) rather than
-editing the released asset in place.
+editing the released asset in place. To start a new step, see
+[Creating a new step with Claude Code](#creating-a-new-step-with-claude-code).
 
 ### What promotion does — and what the framework is *for*
 
@@ -63,7 +69,7 @@ builds on) does five things and no more:
 1. **Renders one token.** `step-template.yaml` → `step.yaml` substituting only the
    literal `${IMAGE_REF}` (empty for public-image steps); all runtime Jinja `{{ … }}`
    and shell `${VAR}` pass through verbatim.
-2. **Copies `src/`** into the released step.
+2. **Copies `src/` and the step's `.gbignore`** into the released step.
 3. **Publishes `USAGE.md` as `README.md`** beside the released `step.yaml`, so the
    step ships user docs (the authoring `README.md` is dev-oriented and is *not*
    published).
@@ -79,8 +85,8 @@ directory produces exactly one released step per environment, so for a public-im
 step like `byoc` the promotion is a byte-for-byte copy. Per-environment variation is
 expressed by **authoring** a separate source dir per environment
 (`steps/<name>/skypilot`, `.../lsf`, …) and by putting multiple
-`environment_configs`/launchers in a single template (e.g. eval's `Skypilot` +
-`Docker`) — it is authored, not fanned out from one definition. There is no roadmap to
+`environment_configs`/launchers in a single template (e.g. both `Skypilot` and
+`Docker` entries) — it is authored, not fanned out from one definition. There is no roadmap to
 generate multiple asset variants from a shared source.
 
 So the value is **not** "less YAML to maintain." It is:
@@ -100,6 +106,61 @@ So the value is **not** "less YAML to maintain." It is:
 place, bypassing the source, its tests, and the sync — the same reason you don't patch
 a build artifact instead of its source. Change the step in `steps/` and re-run
 `make publish-step`.
+
+## Creating a new step with Claude Code
+
+The repo ships a Claude Code skill,
+[`create-framework-step`](../.claude/skills/create-framework-step/SKILL.md), that
+generates the skeleton of a new step in this framework. In Claude Code, run
+`/create-framework-step`, or just ask to create a new framework step.
+
+It asks two rounds of questions, skipping any your request already answers:
+
+1. **What the step is:** its name, its category, and comma-separated lists of input
+   and output names. The category is `eval`, `train`, `tune`, `data`, or one you
+   type, and it becomes the directory under `steps/`: the step lands at
+   `steps/<category>/<name>/<env>/` and is referenced as
+   `space://steps/<category>/<name>` (see [Nested steps](#nested-steps)).
+2. **Where it runs:** the environment (`skypilot`, `docker` or `bash`), a public or
+   custom image (see [Two step types](#two-step-types)), and which clusters get
+   build tests.
+
+It then writes the whole skeleton:
+
+* **`Makefile`**: `STEP_NAME`, the include of `common.mk`, `test-setup` targets for the
+  local clusters chosen, and `REGISTRY` for a custom image.
+* **`step-template.yaml`**: each input and output with `type: dataset` by default, an
+  empty step-specific config block for you to fill in, and a launcher whose `run:`
+  passes every input and output to `src/run.sh`.
+* **`src/setup.sh` and `src/run.sh`**: comment-only stubs that say what each script is
+  for and how `step-template.yaml` calls it. The skill implements nothing.
+* **`Dockerfile`**, for a custom image: a buildable Debian-slim skeleton with a
+  non-root user.
+* **One build test per chosen cluster**, in `test/<cluster>/`, with fixtures in
+  `test-data/<cluster>/`. A test whose `space_uri` is an IBM `github.ibm.com` space is
+  marked `ibm` (see [Two test modes](#two-test-modes)). Fixture outputs are `hf://`
+  datasets that `HfPushCleanupMixin` names per run and deletes afterwards.
+* **`USAGE.md` and `README.md`** outlines.
+
+Everything still to decide is marked `FIXME`, so `grep -rn FIXME steps/<category>/<name>`
+lists it. The skill runs nothing (no `make`, tests or builds) and commits nothing. It
+finishes with your next steps, in order:
+
+1. Check the input and output types.
+2. Describe the configuration you want; you can tell Claude, and it fills it in.
+3. Set the image.
+4. Implement `src/setup.sh` and `src/run.sh`.
+5. Choose test data.
+6. Write the docs.
+7. Run `make space` and `make test`.
+8. `make publish-step` once no `FIXME` remains.
+
+The build tests can't pass until `run.sh` prints the artifact marker (see
+[Emitting data from a step](#emitting-data-from-a-step-stdout-markers)).
+
+**Existing steps.** Most steps already sit under a category (`steps/data/dpk`,
+`steps/eval/eval-example`, the `steps/distill/*` steps). `byoc` and `bfcl-eval` predate
+the category layout and still sit one level up, at `steps/<name>/<env>/`.
 
 ## Layout of a step/environment directory
 
@@ -135,13 +196,21 @@ Present or absent depending on what the step needs:
 * **`src/`** — a directory of code referenced by the step. For image
   steps it is baked into the image; for public-image steps it can be made
   available to the running step (e.g. via SkyPilot `file_mounts`).
+* **`.gbignore`** — the files gbserver ships verbatim instead of Jinja-rendering them,
+  as an additive list of globs (no `!` negation). Every step needs one, next to its
+  Makefile: `make space` (and so `make test`) and `make publish-step` both copy it
+  beside the rendered `step.yaml`, so the step renders the same way when tested and
+  when published, and both refuse a step that has none. The usual list is `**/*.md`
+  (docs can show `{{ … }}` examples) and `src/**` (scripts are never templated); the
+  `create-framework-step` skill writes that for new steps. Edit it when a step needs a
+  different list.
 * **`test/`** — the step's own tests, run with `make test` (`src/` is
   put on `PYTHONPATH`; pytest recurses the whole tree). These are developed and
   run **independently** of the repository's central suite (they are not in its
   `testpaths`). Cluster-specific build tests live in a **per-cluster subdir**
   (`test/<cluster>/`, e.g. `test/slurm/`, `test/docker/`) so each cluster's test
   is self-contained; cluster-agnostic unit tests for `src/` can stay at `test/`'s
-  root (see `eval/skypilot/test/test_eval.py`). It sits beside `src/` but is
+  root (see `eval/eval-example/skypilot/test/test_eval.py`). It sits beside `src/` but is
   **not** bundled into the deployable step.
 * **`test-data/`** — fixtures for the tests in `test/`, mirrored into
   the **same per-cluster subdir** (`test-data/<cluster>/`, e.g. a build test's
@@ -151,7 +220,7 @@ Present or absent depending on what the step needs:
 * **`README.md`** — the **development-oriented** doc: how the step is
   generated/built/published, its test modes, drift, and framework framing, plus a
   prominent pointer to `USAGE.md` (see [`byoc/skypilot`](byoc/skypilot/README.md) and
-  [`eval/skypilot`](eval/skypilot/README.md) for the two step-type examples). Unlike
+  [`eval/eval-example/skypilot`](eval/eval-example/skypilot/README.md) for the two step-type examples). Unlike
   `USAGE.md`, this authoring README is **not** published — `publish-step` ships
   `USAGE.md` as the released step's `README.md` instead. Conventional for every step,
   though not needed to build or render one.
@@ -183,7 +252,7 @@ To author a nested step, the only thing that changes is the Makefile's `include`
 depth — it must point at `steps/common.mk` from wherever the step dir lives:
 
 ```make
-STEP_NAME := foo                 # slash-free leaf (feeds IMAGE_NAME / SPACE_NAME)
+STEP_NAME := foo                 # slash-free leaf (feeds IMAGE_NAME)
 include ../../../common.mk       # one ../ deeper than a flat step's ../../common.mk
 ```
 
@@ -195,6 +264,10 @@ then:
 * copies its tests to `test/steps/distill/foo/<env>/<cluster>/` (fixtures mirrored
   under `test-data/steps/distill/foo/<env>/<cluster>/`);
 * is referenced by the multi-segment URI `space://steps/distill/foo`.
+
+The same layout groups steps by category: `steps/eval/eval-example/skypilot` is the
+`eval-example` step in the `eval` category (`STEP_PATH = eval/eval-example`, URI
+`space://steps/eval/eval-example`).
 
 The resolver binds that URI by **longest matching prefix**: the step name is the
 longest `steps/`-relative prefix of the URI whose directory holds a `step.yaml`, and
@@ -208,7 +281,8 @@ where no `step.yaml` sits at the longer prefix) resolve exactly as before.
 Which type a step is is **auto-detected from the presence of a `Dockerfile`**
 next to the Makefile — there is no flag to set.
 
-1. **Custom-image step** (has a `Dockerfile`, exemplar: **`eval`**) — the
+1. **Custom-image step** (has a `Dockerfile`, exemplar: **`eval-example`** at
+   `steps/eval/eval-example/skypilot`, kept unpublished as a template) — the
    step's code/deps are baked into an image built from `Dockerfile`, published to a
    registry, and referenced from the generated `step.yaml` via `image_id`.
 2. **Public-image step** (no `Dockerfile`, exemplar: **`byoc`**) — the
@@ -247,14 +321,23 @@ Defined once in [`common.mk`](common.mk) and shared by every step:
   manifest inspect`) and needs no credentials for a public image. Bypass it with
   `make publish-step PUBLISH_REQUIRE_IMAGE=false` (offline/local publishing).
   Non-image (public-image) steps have no `IMAGE_REF`, so the check is skipped.
+  A step whose Makefile sets `override STEP_PUBLISHABLE := false` (an exemplar kept
+  only as a template, e.g. [`eval/eval-example/skypilot`](eval/eval-example/skypilot/README.md))
+  refuses `publish-step` outright, before writing anything. The guard fails closed:
+  only the exact value `true` (the default) publishes; any other value blocks.
 * **`check-published`** — verify the committed generated artifacts still match a
   fresh render of the current source (see
   [Generated artifacts and drift](#generated-artifacts-and-drift)). Re-renders
   `publish-step` into a temp dir and `diff`s it against the three committed trees,
   exiting non-zero on drift. It re-renders image steps with the **already-committed**
   image reference (extracted from the published `step.yaml`), so it is immune to the
-  per-commit `IMAGE_TAG` churn and flags only genuine content drift. Exit 0 when in
-  sync (or nothing is published yet).
+  per-commit `IMAGE_TAG` churn and flags only genuine content drift. Succeeds when in
+  sync, or when none of the three published locations exists. Otherwise it fails, and
+  its message says why: `DRIFT` (re-run `make publish-step`); `STALE` (a step that is
+  not publishable, `STEP_PUBLISHABLE` not `true`, still has a committed copy in any of
+  the three locations, listed with the paths to `git rm -r`); or `ERROR` (the re-render
+  itself failed; its output is printed and nothing is compared). Go by the message, not
+  the exit status: make exits 2 whenever a recipe fails, whatever the cause.
 * **`all`** — the full pipeline: `image` + `publish-image` + `space` for image steps,
   or just `space` for public-image steps.
 * **`test`** — render the Space (depends on `space`) **and build the image
@@ -275,6 +358,11 @@ Defined once in [`common.mk`](common.mk) and shared by every step:
   and a *second* `sky launch` in the same pytest process then fails during provisioning
   with `OSError: [Errno 9] Bad file descriptor`. A single-launch test survives by luck, so
   the failure appears only in multi-target fixtures and looks intermittent.
+  pytest doesn't load the repo's `test/conftest.py` for tests under `steps/`, so
+  `make test` sets two variables the repo suites get from there, each only if you
+  haven't set it: `GB_ENVIRONMENT=STANDALONE` (unset, gbserver defaults to PROD and the
+  build-test base refuses to run) and `GBTEST_STANDALONE_ENVIRONMENT=STAGING` (sends an
+  `hf://` push to the staging resource group). Set either yourself to override it.
 * **`test-setup`** — optional per-step hook that stands up the infrastructure a
   step's tests need (e.g. a local Docker SLURM cluster). It is a **separate
   target, deliberately not a prerequisite of `test`**, so the (often slow) infra
@@ -293,7 +381,7 @@ Defined once in [`common.mk`](common.mk) and shared by every step:
 
 | Variable          | Default                                   | Meaning                          |
 |-------------------|-------------------------------------------|----------------------------------|
-| `STEP_NAME`       | *(set by each step's Makefile)*           | logical step name; the **slash-free leaf** (feeds `IMAGE_NAME`/`SPACE_NAME`, which can't contain `/`) |
+| `STEP_NAME`       | *(set by each step's Makefile)*           | logical step name; the **slash-free leaf** (feeds `IMAGE_NAME`, which can't contain `/`) |
 | `STEP_PATH`       | *(auto-derived)* the step's dir relative to the enclosing `steps/`, minus the `<env>` segment | the step's **identity path**; drives the publish/test/space locations and the `space://steps/<path>` URI. For a flat step (`steps/<name>/<env>`) it equals `STEP_NAME`; for a nested step (`steps/<a>/<b>/<env>`) it is `<a>/<b>`. Structural (from `CURDIR` + include depth) — authors never set it |
 | `DOCKER`          | `podman`                                  | container tool                   |
 | `DOCKERFILE`      | `Dockerfile`                              | its presence enables image build/push |
@@ -302,7 +390,7 @@ Defined once in [`common.mk`](common.mk) and shared by every step:
 | `IMAGE_TAG`       | git short SHA, else `latest`              | image tag                        |
 | `IMAGE_REF`       | `$(REGISTRY)/$(IMAGE_NAME):$(IMAGE_TAG)`   | full image reference (derived)   |
 | `SPACE_DIR`       | `space`                                   | generated Space directory name   |
-| `SPACE_NAME`      | `$(STEP_NAME)`                            | `name:` in the generated `space.yaml` |
+| `SPACE_NAME`      | `public`                                  | `name:` in the generated `space.yaml`. Matches the shared `configurations/spaces/local`, because an `hf://` push derives its HF resource group from the space name (`gbspace-<space>`); a step-named space would look for a group that doesn't exist |
 | `SPACE_BASE_URI`  | relative `file://` to `configurations/assets` (resolved against the space.yaml's dir) | base_uri chained by the generated Space |
 | `DEFAULT_ENVIRONMENT` | *(empty)*                             | if set, written as `variables.DEFAULT_ENVIRONMENT` in `space.yaml` |
 | `TEST_DIR`        | `test`                                    | dir of Python tests run by `make test` |
@@ -390,17 +478,18 @@ Two worked examples, one per step type, each in a per-cluster subdir:
   `make -C steps/byoc/skypilot test`, which renders the Space (`make space`) first
   so the test's `space_uri` resolves. End-to-end execution needs a real SkyPilot
   cluster (see the local `make slurm-setup`).
-* **Custom-image step on SkyPilot/aws** — the `eval` build test at
-  [`eval/skypilot/test/aws/test_skypilot_aws_eval.py`](eval/skypilot/test/aws/test_skypilot_aws_eval.py),
+* **Custom-image step on SkyPilot/aws** — the `eval-example` build test at
+  [`eval/eval-example/skypilot/test/aws/test_skypilot_aws_eval.py`](eval/eval-example/skypilot/test/aws/test_skypilot_aws_eval.py),
   driven by its fixtures in
-  [`eval/skypilot/test-data/aws/`](eval/skypilot/test-data/aws/). Run it with
-  `make -C steps/eval/skypilot test`, which renders the Space (`make space`) first
+  [`eval/eval-example/skypilot/test-data/aws/`](eval/eval-example/skypilot/test-data/aws/). Run it with
+  `make -C steps/eval/eval-example/skypilot test`, which renders the Space (`make space`) first
   so the test's `space_uri` resolves. End-to-end execution provisions a real EC2
-  instance via SkyPilot, which **pulls the eval image from its registry** by the
+  instance via SkyPilot, which **pulls the eval-example image from its registry** by the
   reference frozen into the step's `image_id` — so the image must be **published
   to a pullable registry first** (`make image publish-image REGISTRY=...`) and AWS
   credentials exported. (A custom-image step cannot run on the local Docker slurm
-  cluster, which has no Pyxis — hence the cloud backend.)
+  cluster, which has no Pyxis — hence the cloud backend.) Because `eval-example` is
+  not publishable, this test runs in Mode 1 only; there is no `test/steps/` copy.
 
 Both submit their `build.yaml` through the buildtest framework; for ad-hoc runs,
 submit a `build.yaml` via the `gbserver` MCP tools (see the `run-gbserver` and
@@ -501,8 +590,20 @@ resolves the step differs (the `space_uri`):
 copies **together**, so a committed `test/steps/<step>/<env>/` always has a matching
 published step to resolve against. Only per-cluster build tests (`test/<cluster>/`
 subdirs) are copied — `src/` and cluster-agnostic unit tests at `test/`'s root (e.g.
-[`eval/skypilot/test/test_eval.py`](eval/skypilot/test/test_eval.py)) stay Mode-1
+[`eval/eval-example/skypilot/test/test_eval.py`](eval/eval-example/skypilot/test/test_eval.py)) stay Mode-1
 only.
+
+**Remote-space (IBM) build tests.** A cluster that only an IBM space defines (e.g.
+BlueVela SLURM, `space://environments/skypilot/slurm/bluevela`) needs a fixture whose
+`space_uri` is that remote git space, e.g.
+`git+ssh://github.ibm.com/granite-dot-build/gb-test.git@gbspace-config`. Mark such a
+test `pytestmark = pytest.mark.ibm`. `publish-step` copies a **remote** `space_uri`
+(any `<scheme>://` URI other than `file://`, such as `git://`, `git+ssh://` or
+`https://`, or the scp-like `user@host:path` form) through **unchanged**. It rewrites
+only local ones: a bare path or a `file://` URI. In both modes, a remote-space test resolves
+`space://steps/<name>` from the remote space, so it exercises the step that space
+has, **not** your local source: publish the step to that space's assets before relying
+on it.
 
 > **Image steps: keep the published image tag and your local build in sync.** For a
 > custom-image step, `make publish-step` freezes a concrete image reference into the

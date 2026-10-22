@@ -30,7 +30,10 @@ make cicd-pr-test     # abbreviated CI set (coverage + parallel)
 make cicd-merge-test  # extended CI set (the `extended` marker)
 # `-setup` targets provision the venv and infra first:
 make quick-tests-setup quick-tests        # fast: GBTEST_MODE=mock, -m "not ibm and not extended"
-make extended-tests-setup extended-tests  # full: GBTEST_MODE=live, -m "not ibm"; setup also brings up SLURM
+make extended-tests-setup extended-tests  # full: GBTEST_MODE=live, -m "not ibm"; setup also brings up SLURM and kind
+make kube-setup    # just the kind cluster for the skypilot/kubernetes tests (installs kind, socat, GNU netcat
+                   # if missing; needs docker + kubectl; leaves your current kube context as it was)
+make kube-teardown # delete the kind cluster and remove gbserver's cloud_config from ~/.sky/config.yaml
 ```
 
 ### Formatting and Linting
@@ -168,7 +171,7 @@ A floating chat widget (rendered globally by `ClientShell`) backed by a hand-rol
 - **Backend**: `src/gb_ui_backend/api/chat.py` (`/api/analytics/chat/{status,stream,stop,confirm}`) + `src/gb_ui_backend/services/chat_agents/` — `tool_loop_backend.py` (the loop itself), `providers/{anthropic_provider,openai_compat_provider}.py`, `dashboard_tools.py`, `gbmcp_policy.py`, `tool_registry.py`, `ui_actions.py`.
 - **Frontend**: `frontend/packages/ui-core/components/ChatWidget.tsx` + `.module.scss`, `frontend/packages/ui-core/api/chat.ts`, `frontend/packages/ui-core/lib/sse.ts` (SSE stream parsing for `chat.ts`'s streaming responses).
 - **Config** (`Config` in `src/gb_ui_backend/config.py`): `chat_backend` (default `tool_loop`), `chat_model`, `chat_llm_base_url`/`chat_llm_api_key` (fall back to `llm_base_url`/`llm_api_key` if unset, via `resolved_chat_llm_base_url`/`resolved_chat_llm_api_key`), `chat_provider` (`openai_compatible` or `anthropic`, auto-detected if unset — OpenAI-compatible wins auto-detection since it requires no external API key). `Config.chat_enabled` reports whether either provider is actually configured. Anthropic auth reads the standard `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` env vars directly (not `GB_UI_`-prefixed — read by the `anthropic` SDK itself).
-- **Install**: the `chat` extra (`mcp`, `regex`) is bundled into `standalone` by default; `chat-anthropic` additionally adds the `anthropic` package and is opt-in (Anthropic is not the default provider).
+- **Install**: the `chat` extra (`mcp`) is bundled into `standalone` by default (`regex`, which `search_build_yaml` uses, is a core dependency); `chat-anthropic` additionally adds the `anthropic` package and is opt-in (Anthropic is not the default provider).
 
 ### Frontend source layout
 

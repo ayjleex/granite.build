@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import re
 from unittest.mock import MagicMock, patch
 
@@ -39,6 +40,19 @@ class TestStepSkypilotConfig:
         assert config.image_id == "docker:nvcr.io/nvidia/pytorch:24.01-py3"
 
 
+@pytest.fixture
+def skypilot_standalone():
+    """Run file_mounts resolution as a STANDALONE server (the suite runs as DEV).
+
+    On a standalone server the user owns the host, so absolute/``file://``
+    sources are passed through; elsewhere they are refused (see
+    TestHostedMountSources).
+    """
+    with patch("gbserver.environment.skypilot.is_standalone", return_value=True):
+        yield
+
+
+@pytest.mark.usefixtures("skypilot_standalone")
 class TestResolveLocalMountSource:
     """_resolve_local_mount_source: relative sources rebase onto the asset dir."""
 
@@ -101,6 +115,7 @@ class TestResolveLocalMountSource:
         assert _resolve_local_mount_source("d", "file:///work/run1") == "/work/run1/d"
 
 
+@pytest.mark.usefixtures("skypilot_standalone")
 class TestBuildSkypilotMounts:
     """_build_skypilot_mounts: routes strings vs dicts and resolves sources."""
 
@@ -149,6 +164,71 @@ class TestBuildSkypilotMounts:
                 {"payload": "payload"}, "/work/run1", "/proj/gbtest/builds/b1"
             )
         assert file_mounts == {"/proj/gbtest/builds/b1/payload": "/work/run1/payload"}
+
+
+class TestHostedMountSources:
+    """Outside STANDALONE, a file_mounts source may only name files in the step dir.
+
+    file_mounts can come from step.yaml (possibly a user's git repo), the
+    build.yaml step ``config:`` (merged on top), or a git-hosted environment, and
+    SkyPilot rsyncs local sources from the gbserver host to the cluster. So an
+    absolute or ``file://`` source, or a step-dir symlink pointing out of it,
+    would ship server files (e.g. ``/home/gbserver/.kube``) to compute.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _hosted(self):
+        with patch("gbserver.environment.skypilot.is_standalone", return_value=False):
+            yield
+
+    @pytest.mark.parametrize(
+        "source",
+        ["/home/gbserver/.kube", "file:///home/gbserver/.kube", "file://host/etc"],
+    )
+    def test_host_path_sources_rejected(self, source, tmp_path):
+        from gbserver.environment.skypilot import _resolve_local_mount_source
+
+        with pytest.raises(ValueError, match="standalone"):
+            _resolve_local_mount_source(source, tmp_path)
+
+    def test_relative_source_inside_step_dir_allowed(self, tmp_path):
+        from gbserver.environment.skypilot import _resolve_local_mount_source
+
+        (tmp_path / "scripts").mkdir()
+        assert _resolve_local_mount_source("scripts", tmp_path) == str(
+            tmp_path / "scripts"
+        )
+
+    def test_symlink_out_of_step_dir_rejected(self, tmp_path):
+        from gbserver.environment.skypilot import _resolve_local_mount_source
+
+        step_dir, outside = tmp_path / "step", tmp_path / "outside"
+        step_dir.mkdir()
+        outside.mkdir()
+        (step_dir / "k").symlink_to(outside)
+        with pytest.raises(ValueError, match="outside the step directory"):
+            _resolve_local_mount_source("k", step_dir)
+
+    def test_relative_source_without_step_dir_rejected(self):
+        from gbserver.environment.skypilot import _resolve_local_mount_source
+
+        with pytest.raises(ValueError, match="no step directory"):
+            _resolve_local_mount_source("scripts", None)
+
+    def test_remote_uri_sources_allowed(self, tmp_path):
+        from gbserver.environment.skypilot import _resolve_local_mount_source
+
+        assert _resolve_local_mount_source("s3://b/k", tmp_path) == "s3://b/k"
+
+    @pytest.mark.parametrize(
+        "mount", ["/home/gbserver/.kube", {"source": "file:///home/gbserver/.kube"}]
+    )
+    def test_build_mounts_rejects_host_sources(self, mount, tmp_path):
+        from gbserver.environment.skypilot import _build_skypilot_mounts
+
+        with patch("gbserver.environment.skypilot.sky", MagicMock()):
+            with pytest.raises(ValueError, match="standalone"):
+                _build_skypilot_mounts({"/tmp/k": mount}, tmp_path)
 
 
 class TestRemapRelativeDest:
@@ -491,6 +571,44 @@ class TestLaunchSkypilot:
         mock_sky.stream_and_get.assert_called_once_with("req-123")
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "infra, ssh_hpc, lsf_cluster",
+        [
+            ("lsf/bluevela/normal", True, "bluevela"),
+            ("slurm/mycluster/gpu", True, None),
+            ("k8s", False, None),
+            ("aws", False, None),
+        ],
+    )
+    async def test_launch_registers_the_poll_failure_grace(
+        self, skypilot_env, infra, ssh_hpc, lsf_cluster
+    ):
+        """What switches the poll loop's grace and `bjobs` check on in
+        production: an SSH HPC launch registers for the grace, and an LSF one
+        also records the ~/.lsf/config host to ask."""
+        mock_sky = MagicMock()
+        mock_sky.launch = MagicMock(return_value="req-123")
+        # The handle carries the name SkyPilot submitted the LSF job under.
+        handle = MagicMock(cluster_name_on_cloud="gb-test-launch-hpc-0a1b2c3d")
+        mock_sky.stream_and_get = MagicMock(return_value=(42, handle))
+        launch_id = "test-launch-hpc"
+        with (
+            patch("gbserver.environment.skypilot.sky", mock_sky),
+            patch("gbserver.environment.skypilot.HAS_SKYPILOT", True),
+        ):
+            skypilot_env._get_launch_ready_event(launch_id)
+            await skypilot_env.launch_skypilot(
+                launch_id=launch_id,
+                launcher_config={"run": "echo hi", "resources": {"infra": infra}},
+                config={},
+            )
+        assert (launch_id in skypilot_env._ssh_hpc_launches) is ssh_hpc
+        assert skypilot_env._lsf_clusters.get(launch_id) == lsf_cluster
+        assert skypilot_env._lsf_job_names.get(launch_id) == (
+            "gb-test-launch-hpc-0a1b2c3d" if lsf_cluster else None
+        )
+
+    @pytest.mark.asyncio
     async def test_launch_embeds_target_and_build_in_cluster_name(self, skypilot_env):
         mock_sky = MagicMock()
         mock_sky.Resources = MagicMock(return_value=MagicMock())
@@ -793,6 +911,47 @@ class TestSkypilotComputeConfigResources:
         assert env._resources_from_compute_config(
             {"num_cpus_per_node": 3}, cloud="lsf"
         ) == {"cpus": 3}
+
+    @pytest.mark.parametrize(
+        "step,cpus,memory",
+        [
+            ("hfpull", 1, "10+"),
+            ("hfpush", 1, "10+"),
+            ("s3pull", 2, "4+"),
+            ("s3push", 2, "4+"),
+        ],
+    )
+    def test_transfer_steps_keep_a_floor_on_every_cloud(self, step, cpus, memory):
+        """The builtin transfer steps carry their floor in compute_config.
+
+        A literal ``cpus: "1+"`` under the launcher's ``resources`` is passed to
+        sky.Resources verbatim and crashes the LSF cloud; dropping it instead
+        left AWS on SkyPilot's large default VM. Routed through compute_config,
+        the floor is a minimum on cloud catalogs and a bare int on LSF.
+        """
+        from pathlib import Path
+
+        import yaml
+
+        from gbserver.environment.skypilot import Skypilot
+
+        step_yaml = (
+            Path(__file__).resolve().parents[3]
+            / f"src/gbserver/builtins/steps/skypilot/{step}/step.yaml"
+        )
+        doc = yaml.safe_load(step_yaml.read_text())
+        launcher = doc["environment_configs"]["Skypilot"]["launchers"][step]
+        assert not launcher["config"]["resources"]
+        compute_config = doc["config"]["compute_config"]
+
+        env = Skypilot(event_q=asyncio.Queue())
+        assert env._resources_from_compute_config(compute_config, cloud="aws") == {
+            "cpus": f"{cpus}+",
+            "memory": memory,
+        }
+        assert env._resources_from_compute_config(compute_config, cloud="lsf") == {
+            "cpus": cpus
+        }
 
     def test_memory_floor_is_minimum_not_exact(self):
         """The cloud memory floor must be a SkyPilot minimum ("{n}+"), not an
@@ -1299,6 +1458,71 @@ class TestSkypilotMonitorLogParsing:
             f"Expected 0 NEWARTIFACT_IN_ENVIRONMENT_EVENT, "
             f"got {len(artifact_events)}. Events: {artifact_events}"
         )
+
+    @pytest.mark.asyncio
+    async def test_a_partial_last_line_is_left_for_the_next_pull(
+        self, skypilot_env_with_terminal_job, tmp_path
+    ):
+        """An artifact line appended to a still-unterminated line is not lost.
+
+        Regression (build 5feb878d): a pull ended on a half-written tqdm bar and
+        counted it as seen; the step then printed GB_ARTIFACT_ID on that same
+        line, and every later pull skipped it.
+        """
+        from gbserver.environment.environment import EventLogLineParserConfig
+
+        env, launch_id, event_q = skypilot_env_with_terminal_job
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        log_file = log_dir / "job-42.log"
+        log_file.write_text("Starting job...\n 40%|████      | 1005/2500")
+
+        async def _pull(start_line_num, final=False):
+            with patch(
+                "gbserver.environment.skypilot._download_logs_with_retry",
+                return_value=str(log_dir),
+            ):
+                return await env._download_and_parse_logs(
+                    cluster_name="gb-log-parse-te",
+                    job_id=42,
+                    launch_id=launch_id,
+                    event_q=event_q,
+                    entityrun_metadata=EntityRunMetadata(build_id="build-log-p"),
+                    event_log_parser_configs=[
+                        EventLogLineParserConfig.model_validate(c)
+                        for c in self.EVENT_CONFIGS
+                    ],
+                    start_line_num=start_line_num,
+                    final=final,
+                )
+
+        def _artifact_events():
+            events = []
+            while not event_q.empty():
+                events.append(event_q.get_nowait())
+            return [
+                e
+                for e in events
+                if e.type == BuildEventType.NEWARTIFACT_IN_ENVIRONMENT_EVENT
+            ]
+
+        # The unterminated bar is not counted, so the next pull rereads it.
+        assert await _pull(0) == 1
+        assert _artifact_events() == []
+
+        with log_file.open("a") as f:
+            f.write(" Generated Data: /tmp/outputs/ck1000.jsonl\nJob complete.")
+        assert await _pull(1) == 2
+        [event] = _artifact_events()
+        assert event.payload.binding["path"] == "/tmp/outputs/ck1000.jsonl"
+
+        # At terminal status the log is complete: its last line is parsed even
+        # without a newline.
+        with log_file.open("a") as f:
+            f.write(" Generated Data: /tmp/outputs/final.jsonl")
+        assert await _pull(2, final=True) == 3
+        [event] = _artifact_events()
+        assert event.payload.binding["path"] == "/tmp/outputs/final.jsonl"
 
     @pytest.mark.asyncio
     async def test_no_event_configs_skips_log_parsing(
@@ -1875,6 +2099,118 @@ class TestSkypilotManagedMonitorLogParsing:
             )
 
 
+@pytest.mark.usefixtures("real_apply_cloud_config")
+class TestApplyCloudConfig:
+    """Each launch carries its own env's cloud_config (last-writer-wins + lock)."""
+
+    @pytest.fixture(autouse=True)
+    def _fresh_loaded(self, monkeypatch):
+        monkeypatch.setattr("gbserver.environment.skypilot._LOADED_CLOUD_CONFIG", None)
+
+    def test_reloads_after_a_write_and_on_env_switch_only(self):
+        """The fix for an edited bsub_options exclusion needing a restart, kept."""
+        from gbserver.environment import skypilot as sp
+
+        written = []
+        with (
+            patch(
+                "gbserver.environment.skypilot_config.merge_cloud_config",
+                side_effect=lambda cc, name: written.append(name) or name == "A",
+            ),
+            patch(
+                "gbserver.environment.skypilot._reload_skypilot_client_config"
+            ) as reload,
+        ):
+            sp._apply_cloud_config("A", {"lsf": {"q": 1}})  # file changed
+            assert reload.call_count == 1
+            sp._apply_cloud_config("B", {"lsf": {"q": 2}})  # file same, other env
+            assert reload.call_count == 2
+            sp._apply_cloud_config("B", {"lsf": {"q": 2}})  # nothing new
+            assert reload.call_count == 2
+        assert written == ["A", "B", "B"]
+
+    def test_launch_applies_then_submits_under_the_lock(self):
+        from gbserver.environment import skypilot as sp
+
+        seen = []
+        with (
+            patch(
+                "gbserver.environment.skypilot._apply_cloud_config",
+                side_effect=lambda name, cc: seen.append(("apply", name, cc)),
+            ),
+            patch("gbserver.environment.skypilot.sky") as sky,
+        ):
+            sky.launch.side_effect = lambda *a, **k: (
+                seen.append(("launch", sp._CLOUD_CONFIG_LOCK.locked(), a, k)) or "req-1"
+            )
+            rid = sp._launch_with_cloud_config(
+                "env-a", {"k": 1}, "task", cluster_name="c", down=True
+            )
+        assert rid == "req-1"
+        assert seen == [
+            ("apply", "env-a", {"k": 1}),
+            ("launch", True, ("task",), {"cluster_name": "c", "down": True}),
+        ]
+        assert not sp._CLOUD_CONFIG_LOCK.locked()
+
+    def test_concurrent_launches_each_carry_their_own_env_config(self):
+        """Two envs launching at once: no launch is submitted with the other's.
+
+        Models the process-global client config: a write lands in the "file", a
+        reload copies the file into the loaded config, and a launch submits
+        whatever is loaded. Without the lock, one env's write between another's
+        write and its submit would send the wrong env's config.
+        """
+        import threading
+        import time as _time
+
+        from gbserver.environment import skypilot as sp
+
+        state = {"file": None, "loaded": None}
+        sent = []
+
+        def merge(cc, name):
+            changed = state["file"] != cc
+            state["file"] = cc
+            _time.sleep(0.001)
+            return changed
+
+        def reload():
+            _time.sleep(0.001)
+            state["loaded"] = state["file"]
+
+        def launch(task, **_):
+            _time.sleep(0.001)
+            sent.append((task, state["loaded"]))
+
+        configs = {"A": {"kubernetes": {"allowed_contexts": ["kind"]}}, "B": None}
+        with (
+            patch(
+                "gbserver.environment.skypilot_config.merge_cloud_config",
+                side_effect=merge,
+            ),
+            patch(
+                "gbserver.environment.skypilot._reload_skypilot_client_config",
+                side_effect=reload,
+            ),
+            patch("gbserver.environment.skypilot.sky") as sky,
+        ):
+            sky.launch.side_effect = launch
+            threads = [
+                threading.Thread(
+                    target=sp._launch_with_cloud_config,
+                    args=(env, configs[env], env),
+                )
+                for env in "AB" * 20
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        assert len(sent) == 40
+        assert all(loaded == configs[env] for env, loaded in sent), sent
+
+
 class TestInlineConfigMaterialization:
     """The Skypilot env wires environment.yaml inline config into materialize()."""
 
@@ -1900,15 +2236,178 @@ class TestInlineConfigMaterialization:
                 "aws_credentials": [{"profile": "default", "aws_access_key_id": "K"}],
             }
         )
-        with patch("gbserver.environment.skypilot_config.materialize") as m:
+        with (
+            patch("gbserver.environment.skypilot_config.materialize") as m,
+            patch("gbserver.environment.skypilot._apply_cloud_config") as apply,
+        ):
             env._ensure_inline_configs_materialized()
             env._ensure_inline_configs_materialized()  # idempotent
             m.assert_called_once()
             args = m.call_args.args
             assert args[0] == "env-inline"  # env name
-            # SSH is NOT materialized here (merged per-launch); only cloud_config
-            # and aws are forwarded.
-            assert args[1] is None and args[2] == {"lsf": {"q": 1}} and args[3]
+            # SSH is NOT materialized here (merged per-launch), and cloud_config
+            # is applied separately (last-writer-wins, again per launch): only
+            # aws is forwarded.
+            assert args[1] is None and args[2] is None and args[3]
+            apply.assert_called_once_with("env-inline", {"lsf": {"q": 1}})
+
+    def test_cloud_config_applied_even_when_absent(self):
+        """An env without cloud_config still applies (removes) the previous one."""
+        env = self._env({"default_cloud": "kubernetes"})
+        with patch("gbserver.environment.skypilot._apply_cloud_config") as apply:
+            env._ensure_inline_configs_materialized()
+        apply.assert_called_once_with("env-inline", None)
+
+    def test_no_reload_when_only_aws_credentials_are_written(self):
+        """~/.aws/credentials is read by boto on use; nothing to reload."""
+        env = self._env(
+            {"aws_credentials": [{"profile": "default", "aws_access_key_id": "K"}]}
+        )
+        with (
+            patch("gbserver.environment.skypilot_config.materialize"),
+            patch(
+                "gbserver.environment.skypilot._reload_skypilot_client_config"
+            ) as reload,
+        ):
+            env._ensure_inline_configs_materialized()
+        reload.assert_not_called()
+
+    def test_reload_makes_an_edited_file_reach_requests(self, tmp_path):
+        """Against real SkyPilot: an edited file is invisible until reloaded.
+
+        ``to_dict()`` is what every request carries to the API server as
+        ``override_skypilot_config``. Isolated from the real ~/.sky/config.yaml
+        via SKYPILOT_GLOBAL_CONFIG, and the process's config is restored after.
+        """
+        pytest.importorskip("sky")
+        from sky import skypilot_config
+
+        from gbserver.environment.skypilot import _reload_skypilot_client_config
+
+        cfg = tmp_path / "config.yaml"
+
+        def write(select):
+            cfg.write_text(
+                "lsf:\n  cluster_configs:\n    bluevela:\n      bsub_options:\n"
+                f'        R: "{select}"\n'
+            )
+
+        def sent():
+            return skypilot_config.to_dict().get_nested(
+                ("lsf", "cluster_configs", "bluevela", "bsub_options", "R"), None
+            )
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setenv("SKYPILOT_GLOBAL_CONFIG", str(cfg))
+            mp.delenv("SKYPILOT_CONFIG", raising=False)
+            mp.delenv("IS_SKYPILOT_SERVER", raising=False)
+            mp.chdir(tmp_path)  # no stray project-level .sky.yaml
+            try:
+                write("select[hname!='old-host']")
+                _reload_skypilot_client_config()
+                assert sent() == "select[hname!='old-host']"
+
+                write("select[hname!='old-host'&&hname!='new-host']")
+                assert sent() == "select[hname!='old-host']", "the stale copy"
+
+                _reload_skypilot_client_config()
+                assert sent() == "select[hname!='old-host'&&hname!='new-host']"
+            finally:
+                mp.undo()
+                skypilot_config.reload_config()
+
+    def test_reload_never_exposes_an_empty_config(self, tmp_path):
+        """SkyPilot's own client reload empties the loaded config before
+        re-reading the files; a concurrent build's request in that window would
+        send no override at all. Every read during the reload must still see
+        the old config."""
+        pytest.importorskip("sky")
+        from sky import skypilot_config
+
+        from gbserver.environment.skypilot import _reload_skypilot_client_config
+
+        cfg = tmp_path / "config.yaml"
+        key = ("lsf", "cluster_configs", "bluevela", "bsub_options", "R")
+
+        def write(select):
+            cfg.write_text(
+                "lsf:\n  cluster_configs:\n    bluevela:\n      bsub_options:\n"
+                f'        R: "{select}"\n'
+            )
+
+        seen_mid_reload = []
+        real_get = skypilot_config._get_config_from_path
+
+        def spying_get(path):
+            seen_mid_reload.append(skypilot_config.to_dict().get_nested(key, None))
+            return real_get(path)
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setenv("SKYPILOT_GLOBAL_CONFIG", str(cfg))
+            mp.delenv("SKYPILOT_CONFIG", raising=False)
+            mp.delenv("IS_SKYPILOT_SERVER", raising=False)
+            mp.chdir(tmp_path)
+            try:
+                write("old")
+                _reload_skypilot_client_config()
+                write("new")
+                mp.setattr(skypilot_config, "_get_config_from_path", spying_get)
+                _reload_skypilot_client_config()
+                assert seen_mid_reload and set(seen_mid_reload) == {"old"}
+                assert skypilot_config.to_dict().get_nested(key, None) == "new"
+            finally:
+                mp.undo()
+                skypilot_config.reload_config()
+
+    def test_reload_matches_skypilots_own_reload(self, tmp_path):
+        """Drift guard: the replica must load what SkyPilot's own client reload
+        loads from the same files -- user and project layers, overlay order,
+        recorded paths. The SkyPilot pin is a moving tag."""
+        pytest.importorskip("sky")
+        from sky import skypilot_config
+
+        from gbserver.environment.skypilot import _reload_skypilot_client_config
+
+        user = tmp_path / "config.yaml"
+        user.write_text(
+            "lsf:\n  cluster_configs:\n    bluevela:\n      bsub_options:\n"
+            '        R: "user"\n        q: "normal"\n'
+            "jobs:\n  controller:\n    resources:\n      cpus: 2\n"
+        )
+        # The project file overrides one nested key and adds another.
+        (tmp_path / ".sky.yaml").write_text(
+            "lsf:\n  cluster_configs:\n    bluevela:\n      bsub_options:\n"
+            '        R: "project"\n'
+            "kubernetes:\n  pod_config:\n    metadata:\n      labels:\n"
+            "        team: gb\n"
+        )
+
+        def loaded():
+            return (
+                skypilot_config.to_dict(),
+                skypilot_config.loaded_config_path(),
+            )
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setenv("SKYPILOT_GLOBAL_CONFIG", str(user))
+            mp.delenv("SKYPILOT_CONFIG", raising=False)
+            mp.delenv("IS_SKYPILOT_SERVER", raising=False)
+            mp.chdir(tmp_path)
+            try:
+                skypilot_config.reload_config()
+                theirs = loaded()
+                _reload_skypilot_client_config()
+                ours = loaded()
+            finally:
+                mp.undo()
+                skypilot_config.reload_config()
+        assert ours == theirs
+        assert (
+            theirs[0].get_nested(
+                ("lsf", "cluster_configs", "bluevela", "bsub_options", "R"), None
+            )
+            == "project"
+        ), "the project layer did not load; the test proves nothing"
 
     @pytest.mark.asyncio
     async def test_ssh_materialized_per_launch(self):
@@ -2043,6 +2542,254 @@ class TestInlineConfigMaterialization:
         assert calls[:2] == ["materialize", "api"]
 
 
+class TestNumNodesResolution:
+    """Resolution of the node count handed to ``sky.Task``.
+
+    ``num_nodes`` is a ``sky.Task`` field, not a ``sky.Resources`` one, so it is
+    resolved on its own rather than merged into the resource layers — and a
+    ``num_nodes`` placed under ``resources`` is discarded by SkyPilot without an
+    error, which is why that case warns rather than being silently ignored.
+    """
+
+    @staticmethod
+    def _resolve(compute_config=None, launcher_config=None, config=None, cloud=""):
+        from gbserver.environment.skypilot import _num_nodes_from_configs
+
+        return _num_nodes_from_configs(
+            compute_config or {},
+            launcher_config or {},
+            config or {},
+            cloud=cloud,
+        )
+
+    def test_defaults_to_one(self):
+        assert self._resolve() == 1
+
+    def test_reads_compute_config(self):
+        """The portable surface: k8s/lsf/runpod already read this key, so one
+        build.yaml expresses a multi-node request across environments."""
+        assert self._resolve(compute_config={"num_nodes": 4}) == 4
+
+    def test_launcher_config_overrides_compute_config(self):
+        assert (
+            self._resolve(
+                compute_config={"num_nodes": 2}, launcher_config={"num_nodes": 3}
+            )
+            == 3
+        )
+
+    def test_build_yaml_launcher_config_wins(self):
+        """Mirrors the cpus/memory precedence: last layer wins."""
+        assert (
+            self._resolve(
+                compute_config={"num_nodes": 2},
+                launcher_config={"num_nodes": 3},
+                config={"launcher_config": {"num_nodes": 4}},
+            )
+            == 4
+        )
+
+    @pytest.mark.parametrize("value", ["2", 2, 2.0])
+    def test_accepts_the_forms_yaml_produces(self, value):
+        assert self._resolve(compute_config={"num_nodes": value}) == 2
+
+    def test_null_value_is_unset(self):
+        """A bare ``num_nodes:`` key is YAML null, i.e. not set."""
+        assert self._resolve(compute_config={"num_nodes": None}) == 1
+
+    @pytest.mark.parametrize("value", ["many", "$${NUM_NODES}", [], 0, -1, 2.5, 1.9])
+    def test_invalid_values_raise(self, value):
+        """Fail fast: falling back to one node would run single-node and look
+        successful, e.g. on an unsubstituted parameter."""
+        with pytest.raises(ValueError, match="num_nodes"):
+            self._resolve(compute_config={"num_nodes": value})
+
+    @pytest.mark.parametrize(
+        "launcher_config,config",
+        [
+            ({"resources": None}, {}),
+            ({}, {"launcher_config": {"resources": None}}),
+            ({}, {"launcher_config": None}),
+        ],
+    )
+    def test_null_resources_does_not_crash(self, launcher_config, config):
+        """A present-but-null ``resources:`` key returns None from .get()."""
+        assert self._resolve(launcher_config=launcher_config, config=config) == 1
+
+    def test_misplaced_under_resources_is_ignored_with_a_warning(self, caplog):
+        """The trap this guards.
+
+        ``sky.Resources`` drops an unknown key without complaint, so before this
+        warning a 4-node request written under ``resources`` produced a
+        single-node run that looked entirely successful.
+        """
+        with caplog.at_level(logging.WARNING):
+            assert self._resolve(launcher_config={"resources": {"num_nodes": 4}}) == 1
+        assert "resources.num_nodes" in caplog.text
+        assert "compute_config.num_nodes" in caplog.text
+
+    def test_misplaced_in_build_yaml_resources_also_warns(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            self._resolve(
+                config={"launcher_config": {"resources": {"num_nodes": 8}}},
+            )
+        assert "resources.num_nodes" in caplog.text
+
+    def test_correctly_placed_num_nodes_does_not_warn(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            assert self._resolve(compute_config={"num_nodes": 2}) == 2
+        assert "resources.num_nodes" not in caplog.text
+
+
+class TestMultinodeSupportPreflight:
+    """LSF multi-node requires the driver-side task executor.
+
+    An older SkyPilot accepts ``num_nodes``, allocates every node, then runs the
+    task once with ``SKYPILOT_NUM_NODES=1`` and reports success — a build that
+    trained on a fraction of its allocation while looking healthy. The guard
+    converts that into a launch-time error.
+    """
+
+    @staticmethod
+    def _check(cloud, num_nodes=2, spec=object()):
+        from gbserver.environment.skypilot import _check_multinode_supported
+
+        with patch(
+            "gbserver.environment.skypilot.importlib.util.find_spec",
+            return_value=spec,
+        ):
+            _check_multinode_supported(cloud, num_nodes)
+
+    def test_passes_when_the_executor_is_present(self):
+        self._check("lsf")
+
+    def test_raises_on_lsf_without_the_executor(self):
+        from gbserver.environment.skypilot import _check_multinode_supported
+
+        with patch(
+            "gbserver.environment.skypilot.importlib.util.find_spec",
+            return_value=None,
+        ):
+            with pytest.raises(RuntimeError, match="gb-sky-v2-multinode"):
+                _check_multinode_supported("lsf", 2)
+
+    def test_raises_when_the_executor_package_is_missing(self):
+        """find_spec raises, rather than returning None, when the parent
+        package sky.skylet.executor does not exist -- the oldest SkyPilot."""
+        from gbserver.environment.skypilot import _check_multinode_supported
+
+        with patch(
+            "gbserver.environment.skypilot.importlib.util.find_spec",
+            side_effect=ModuleNotFoundError("No module named 'sky.skylet.executor'"),
+        ):
+            with pytest.raises(RuntimeError, match="gb-sky-v2-multinode"):
+                _check_multinode_supported("lsf", 2)
+
+    @pytest.mark.parametrize("cloud", ["k8s", "aws", "slurm", ""])
+    def test_other_clouds_are_not_gated(self, cloud):
+        """Only the LSF cloud has this requirement."""
+        self._check(cloud, spec=None)
+
+    def test_single_node_lsf_never_reaches_the_check(self):
+        """num_nodes == 1 works on any SkyPilot build, so it must not be gated."""
+        from gbserver.environment.skypilot import _num_nodes_from_configs
+
+        with patch(
+            "gbserver.environment.skypilot.importlib.util.find_spec",
+            return_value=None,
+        ):
+            assert _num_nodes_from_configs({}, {}, {}, cloud="lsf") == 1
+
+    def test_multinode_lsf_is_gated_through_the_resolver(self):
+        from gbserver.environment.skypilot import _num_nodes_from_configs
+
+        with patch(
+            "gbserver.environment.skypilot.importlib.util.find_spec",
+            return_value=None,
+        ):
+            with pytest.raises(RuntimeError, match="predates LSF multi-node"):
+                _num_nodes_from_configs({"num_nodes": 2}, {}, {}, cloud="lsf")
+
+
+class TestNumNodesReachesSkyTask:
+    """The end of the chain: whatever was resolved must reach ``sky.Task``."""
+
+    @pytest.fixture
+    def skypilot_env(self):
+        from gbserver.environment.skypilot import Skypilot
+        from gbserver.types.environmentconfig import EnvironmentConfig
+
+        event_q = asyncio.Queue()
+        config = EnvironmentConfig(
+            name="test-skypilot",
+            type="Skypilot",
+            config={"default_cloud": "k8s"},
+        )
+        return Skypilot(event_q=event_q, environment_config=config)
+
+    async def _launch(self, env, launcher_config, config):
+        mock_sky = MagicMock()
+        mock_sky.Resources = MagicMock(return_value=MagicMock())
+        mock_sky.Task = MagicMock(return_value=MagicMock())
+        mock_sky.launch = MagicMock(return_value="req-1")
+        mock_sky.stream_and_get = MagicMock(return_value=(1, MagicMock()))
+
+        with (
+            patch("gbserver.environment.skypilot.sky", mock_sky),
+            patch("gbserver.environment.skypilot.HAS_SKYPILOT", True),
+        ):
+            launch_id = "nn-launch"
+            env._get_launch_ready_event(launch_id)
+            await env.launch_skypilot(
+                launch_id=launch_id,
+                launcher_config=launcher_config,
+                config=config,
+            )
+        return mock_sky.Task.call_args.kwargs
+
+    @pytest.mark.asyncio
+    async def test_default_is_single_node(self, skypilot_env):
+        kwargs = await self._launch(skypilot_env, {"run": "echo hi"}, {})
+        assert kwargs["num_nodes"] == 1
+
+    @pytest.mark.asyncio
+    async def test_compute_config_reaches_sky_task(self, skypilot_env):
+        """Before this, sky.Task was constructed without num_nodes at all, so
+        every SkyPilot build was single-node whatever the build.yaml said."""
+        kwargs = await self._launch(
+            skypilot_env, {"run": "echo hi"}, {"compute_config": {"num_nodes": 2}}
+        )
+        assert kwargs["num_nodes"] == 2
+
+    @pytest.mark.asyncio
+    async def test_launcher_override_reaches_sky_task(self, skypilot_env):
+        kwargs = await self._launch(
+            skypilot_env,
+            {"run": "echo hi", "num_nodes": 3},
+            {"compute_config": {"num_nodes": 2}},
+        )
+        assert kwargs["num_nodes"] == 3
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "launcher_config,config",
+        [
+            ({"run": "echo hi", "resources": None}, {}),
+            ({"run": "echo hi"}, {"launcher_config": {"resources": None}}),
+            ({"run": "echo hi"}, {"launcher_config": None}),
+        ],
+    )
+    async def test_null_resources_does_not_crash_the_launch(
+        self, skypilot_env, launcher_config, config
+    ):
+        """A present-but-null ``resources:`` (or ``launcher_config:``) key returns
+        None from .get(), not the default. The cloud lookup and the resource merge
+        read it before the node count is resolved, so the resolver's own guard
+        never got the chance to run."""
+        kwargs = await self._launch(skypilot_env, launcher_config, config)
+        assert kwargs["num_nodes"] == 1
+
+
 from gbserver.environment import skypilot as skymod
 
 
@@ -2062,6 +2809,8 @@ class _FakeProvider:
 class _WorkdirMount:
     def __init__(self, mp):
         self.mount_point = mp
+        # Mirrors SharedFilesystemConfig.efs; None => non-access-point mount.
+        self.efs = None
 
 
 def test_prologue_orders_mount_before_cd_and_chmods_1777():
@@ -2407,3 +3156,49 @@ def test_no_gbserver_pinned_container_run_options():
     constant were removed; assert they no longer exist."""
     assert not hasattr(skymod, "_with_container_mount_options")
     assert not hasattr(skymod, "_CONTAINER_SHARED_FS_RUN_OPTIONS")
+
+
+def test_prologue_access_point_skips_chmod_walk():
+    import subprocess
+
+    from gbserver.environment.shared_fs.config import SharedFilesystemConfig
+
+    wm = SharedFilesystemConfig.model_validate(
+        {
+            "provider": "efs",
+            "mount_point": "/mnt/gb-shared",
+            "efs": {
+                "file_system_id": "fs-1",
+                "region": "us-east-1",
+                "access_point_id": "fsap-1",
+            },
+        }
+    )
+    sh = skymod._compose_step_prologue(
+        [_FakeProvider()], {}, wm, "/mnt/gb-shared/gbroot/builds/b/runs/r"
+    )
+    assert sh.startswith("set -eu")
+    assert 'mkdir -p "$GB_BUILD_WORKDIR"' in sh
+    assert 'cd "$GB_BUILD_WORKDIR"' in sh
+    # The AP pins a fixed uid/gid, so no world-writable bootstrap.
+    assert "chmod 1777" not in sh
+    assert "umask 000" not in sh
+    proc = subprocess.run(["bash", "-n"], input=sh, text=True, capture_output=True)
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_prologue_non_access_point_keeps_chmod_walk():
+    from gbserver.environment.shared_fs.config import SharedFilesystemConfig
+
+    wm = SharedFilesystemConfig.model_validate(
+        {
+            "provider": "efs",
+            "mount_point": "/mnt/gb-shared",
+            "efs": {"file_system_id": "fs-1", "region": "us-east-1"},
+        }
+    )
+    sh = skymod._compose_step_prologue(
+        [_FakeProvider()], {}, wm, "/mnt/gb-shared/gbroot/builds/b/runs/r"
+    )
+    assert "chmod 1777" in sh
+    assert "umask 000" in sh

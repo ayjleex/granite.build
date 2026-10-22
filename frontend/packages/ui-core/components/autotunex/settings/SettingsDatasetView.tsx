@@ -1,0 +1,181 @@
+'use client'
+
+import {
+  Modal,
+  InlineLoading,
+  FormLabel,
+  Tabs,
+  TabList,
+  Tab,
+  TabPanels,
+  TabPanel,
+  InlineNotification,
+} from '@carbon/react'
+import { useQuery } from '@tanstack/react-query'
+import { getDataset } from '../../../api/autotunex'
+import type { Dataset } from '../../../types'
+import { PreviewTable } from '../shared/PreviewTable'
+import { formatBytes } from '../../../lib/autotunex/formatBytes'
+
+function formatAppliedMapping(mapping: Record<string, string> | undefined): string {
+  if (!mapping || Object.keys(mapping).length === 0) return '—'
+  return Object.entries(mapping)
+    .map(([target, source]) => `${target} ← ${source}`)
+    .join(', ')
+}
+
+/**
+ * Retained versus original, flagged when the import hit the row cap.
+ *
+ * `truncated` is the server's verdict and is needed on top of the row comparison:
+ * a cap that lands on a shard boundary leaves the two counts equal while whole
+ * shards went unread (see `truncationNotice`, which the wizard uses).
+ */
+function formatRowsKept(
+  retained: number | undefined,
+  original: number | undefined,
+  truncated?: boolean | null
+): string {
+  if (typeof retained !== 'number' || typeof original !== 'number') return '—'
+  const capped = retained < original || truncated === true ? ' (capped)' : ''
+  return `${retained.toLocaleString()} of ${original.toLocaleString()}${capped}`
+}
+
+interface Props {
+  open: boolean
+  datasetId: string | null
+  onClose: () => void
+  /**
+   * Scope for the detail fetch. Must match the scope the caller listed with:
+   * defaulting to 'own' while the caller lists `scope=all` makes an admin's
+   * click on another user's dataset fail.
+   */
+  scope?: 'own' | 'all'
+}
+
+export function SettingsDatasetView({ open, datasetId, onClose, scope = 'own' }: Props) {
+  const { data: dataset, isLoading, isError } = useQuery<Dataset>({
+    queryKey: ['autotunex-dataset', datasetId, 'preview', scope],
+    queryFn: () => getDataset(datasetId as string, { preview: true, previewRows: 50, scope }),
+    enabled: open && datasetId != null,
+  })
+
+  return (
+    <Modal
+      open={open}
+      passiveModal
+      size="lg"
+      modalHeading={dataset ? `Dataset: ${dataset.name}` : 'Dataset'}
+      onRequestClose={onClose}
+    >
+      {isError ? (
+        <InlineNotification
+          kind="error"
+          title="Couldn't load this dataset"
+          subtitle="It may have been deleted, or you may not have access to it."
+          lowContrast
+          hideCloseButton
+        />
+      ) : isLoading || !dataset ? (
+        <InlineLoading description="Loading dataset…" />
+      ) : (
+        <div>
+          {dataset.status !== 'ready' && (
+            <InlineNotification
+              kind={dataset.status === 'error' ? 'error' : 'info'}
+              title={dataset.status === 'error' ? 'Dataset processing failed' : 'Dataset is still processing'}
+              subtitle={dataset.status_detail ?? (dataset.status === 'error' ? 'Please check the uploaded file and try again.' : 'Preview may be incomplete until processing finishes.')}
+              lowContrast
+              hideCloseButton
+              style={{ marginBottom: '1rem' }}
+            />
+          )}
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '1.5rem', marginBottom: '1.5rem' }}>
+            {([
+              ['Training samples', dataset.train_records?.toLocaleString() ?? '0'],
+              ['Validation samples', dataset.validation_records?.toLocaleString() ?? '0'],
+              ['Training file size', formatBytes(dataset.train_file_size)],
+              ['Validation file size', formatBytes(dataset.validation_file_size)],
+              ['Format', dataset.data_format ?? '—'],
+              ['Created on', dataset.created_at ? new Date(dataset.created_at).toLocaleString() : '—'],
+            ] as [string, string][]).map(([label, value]) => (
+              <div key={label} style={{ minWidth: '10rem' }}>
+                <FormLabel>{label}</FormLabel>
+                <div style={{ fontFamily: 'monospace' }}>{value}</div>
+              </div>
+            ))}
+          </div>
+
+          {dataset.hf_repo_id && (
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '1.5rem', marginBottom: '1.5rem' }}>
+              <div style={{ minWidth: '10rem' }}>
+                <FormLabel>HuggingFace repo</FormLabel>
+                <div style={{ fontFamily: 'monospace' }}>
+                  <a
+                    href={`https://huggingface.co/datasets/${dataset.hf_repo_id}`}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    {dataset.hf_repo_id}
+                  </a>
+                </div>
+              </div>
+              {([
+                ['Revision', dataset.hf_revision ? dataset.hf_revision.slice(0, 7) : '—'],
+                ['Config', dataset.hf_config ?? '—'],
+                ['Split', dataset.hf_split ?? '—'],
+                ['Applied mapping', formatAppliedMapping(dataset.hf_provenance?.column_mapping)],
+                [
+                  'Train rows kept',
+                  formatRowsKept(
+                    dataset.hf_provenance?.train_retained_rows,
+                    dataset.hf_provenance?.train_original_rows,
+                    dataset.hf_provenance?.train_truncated
+                  ),
+                ],
+                [
+                  'Validation rows kept',
+                  formatRowsKept(
+                    dataset.hf_provenance?.validation_retained_rows,
+                    dataset.hf_provenance?.validation_original_rows,
+                    dataset.hf_provenance?.validation_truncated
+                  ),
+                ],
+              ] as [string, string][]).map(([label, value]) => (
+                <div key={label} style={{ minWidth: '10rem' }}>
+                  <FormLabel>{label}</FormLabel>
+                  <div style={{ fontFamily: 'monospace' }} title={label === 'Revision' ? dataset.hf_revision : undefined}>
+                    {value}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <Tabs>
+            <TabList aria-label="Dataset preview">
+              <Tab>Train</Tab>
+              <Tab>Validation</Tab>
+            </TabList>
+            <TabPanels>
+              <TabPanel>
+                <PreviewTable
+                  rows={dataset.preview?.train ?? []}
+                  maxRows={50}
+                  emptyMessage="No preview rows available."
+                />
+              </TabPanel>
+              <TabPanel>
+                <PreviewTable
+                  rows={dataset.preview?.validation ?? []}
+                  maxRows={50}
+                  emptyMessage="No preview rows available."
+                />
+              </TabPanel>
+            </TabPanels>
+          </Tabs>
+        </div>
+      )}
+    </Modal>
+  )
+}

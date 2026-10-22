@@ -1,0 +1,188 @@
+/**
+ * The build detail page must decide whether to show its AutoTuneX panels from the
+ * linked tuning job, never from build tags.
+ *
+ * The tag came from AutoTuneX's `gb_tags` setting (autotunex/src/autotunex/core/
+ * config.py) — renameable, extendable to a comma-separated list, and empty
+ * disables tagging entirely — so matching it against hardcoded literals silently
+ * dropped every AutoTuneX panel whenever an operator changed that setting.
+ * `GET /jobs/by-build-id/{build_id}` is the authoritative answer, and is now asked
+ * for every build.
+ *
+ * These are static checks on file contents. This workspace's `node --test` harness
+ * has no DOM, so a "does not contain" assertion on a MISSING file would pass
+ * vacuously and silently stop verifying anything — every such check below is
+ * therefore preceded by an assertion that the file was actually read.
+ *
+ * Usage: node --test tests/autotunex-build-gate.test.js
+ */
+
+const { describe, it } = require('node:test')
+const assert = require('node:assert/strict')
+const fs = require('fs')
+const path = require('path')
+
+const BUILD_PAGE = path.join(__dirname, '..', 'app', 'dashboard', 'builds', '[buildId]')
+
+function read(dir, rel) {
+  try {
+    return fs.readFileSync(path.join(dir, rel), 'utf8')
+  } catch {
+    return ''
+  }
+}
+
+// The source-text checks below must not be satisfied by a commented-out option:
+// `// retry: false` matches the same regex as the live option, so disabling one by
+// commenting it out would leave its check passing.
+function stripComments(src) {
+  return src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1')
+}
+
+describe('the linked job, not build tags, gates the AutoTuneX panels', () => {
+  it('useLinkedTuningJob owns the by-build-id lookup', () => {
+    const hook = read(BUILD_PAGE, 'useLinkedTuningJob.ts')
+    assert.ok(hook, 'useLinkedTuningJob.ts should exist')
+    assert.match(hook, /getJobByBuildId/, 'the hook should own the by-build-id lookup')
+  })
+
+  it('the lookup does not retry', () => {
+    // A deployment without AutoTuneX answers 502 on every build page. Retrying a
+    // 502 that cannot succeed costs one extra request per page and shows the user
+    // nothing either way, since every failure renders silently. That's one, not
+    // react-query's library default of three, because this app's own QueryClient
+    // (ClientShell) already sets `retry: 1`.
+    const hook = read(BUILD_PAGE, 'useLinkedTuningJob.ts')
+    assert.ok(hook, 'useLinkedTuningJob.ts should exist')
+    assert.match(stripComments(hook), /retry:\s*false/, 'the lookup should not retry')
+  })
+
+  it('the lookup waits for the admin check before firing', () => {
+    // `isAdmin` is part of the query key and starts false while the AutoTuneX
+    // admin check is in flight. Without waiting for it, the lookup fires twice for
+    // an admin — once at scope=own, then again at scope=all under a new key. The
+    // bug is invisible in the UI (identical render, one extra request), so nothing
+    // but this mechanical check catches someone removing `&& !adminPending` as
+    // apparently redundant.
+    const hook = read(BUILD_PAGE, 'useLinkedTuningJob.ts')
+    assert.ok(hook, 'useLinkedTuningJob.ts should exist')
+    assert.match(stripComments(hook), /!adminPending/, 'the lookup must wait for the admin check so isAdmin is settled before the key is built')
+  })
+
+  it('BuildDetails does not read build tags', () => {
+    const details = read(BUILD_PAGE, 'BuildDetails.tsx')
+    assert.ok(details, 'BuildDetails.tsx should exist')
+    assert.ok(
+      !details.includes('build?.tags'),
+      'BuildDetails should gate the AutoTuneX panels on the linked job, not build tags',
+    )
+    assert.ok(
+      !details.includes('model-customisation'),
+      'BuildDetails should not match hardcoded tag literals',
+    )
+    assert.match(details, /useLinkedTuningJob\(buildId\)/, 'BuildDetails should gate on the linked-job lookup')
+  })
+
+  it('AutoTuneXPanel takes the job as a prop instead of fetching it', () => {
+    const panel = read(BUILD_PAGE, 'AutoTuneXPanel.tsx')
+    assert.ok(panel, 'AutoTuneXPanel.tsx should exist')
+    assert.ok(
+      !panel.includes('getJobByBuildId'),
+      'BuildDetails owns the lookup; AutoTuneXPanel should not fetch the job',
+    )
+    assert.ok(
+      !panel.includes('listSpaces'),
+      'the scope travels with the job as a prop; AutoTuneXPanel should not resolve its own',
+    )
+  })
+
+  it('the Trials and Logs panels take the job as a prop instead of fetching it', () => {
+    const panels = read(BUILD_PAGE, 'AutoTuneXJobPanels.tsx')
+    assert.ok(panels, 'AutoTuneXJobPanels.tsx should exist')
+    assert.ok(
+      !panels.includes('getJobByBuildId'),
+      'BuildDetails owns the lookup; these panels should not fetch the job',
+    )
+    assert.ok(
+      !panels.includes('listSpaces'),
+      'the scope travels with the job as a prop; these panels should not resolve their own',
+    )
+    assert.ok(
+      !panels.includes('NoJob'),
+      'a panel only mounts when a job exists, so the no-job notice is unreachable',
+    )
+  })
+})
+
+describe('the build and tuning fields stack at phone width', () => {
+  it('the single-column layout resets the inline grid-row', () => {
+    // Both panels place each field with an inline `style={{ gridRow: row }}`, and
+    // the <=640px block moved every field to column 1 without resetting the row,
+    // so the build and tuning fields with the same row landed in the same cell
+    // and drew over each other. An inline style beats a stylesheet rule unless
+    // the rule is !important.
+    const scss = read(BUILD_PAGE, 'DetailsPanel.module.scss')
+    assert.ok(scss, 'DetailsPanel.module.scss should exist')
+    const phone = scss.match(/@media \(max-width: 640px\) \{([\s\S]*?)\n\}/)
+    assert.ok(phone, 'the 640px media block should exist')
+    assert.match(phone[1], /grid-row:\s*auto\s*!important/, 'the phone layout should reset grid-row')
+  })
+})
+
+describe('the tuning detail page reads the build id', () => {
+  it('getJob asks for the full job shape', () => {
+    // The Details tab reads job.tasks[0].build_id, and only the full shape
+    // (JobRead) carries `tasks`; `?shape=lean` returned JobDetail, so the Build ID
+    // field was always blank.
+    const api = read(path.join(__dirname, '..', '..', '..', 'packages', 'ui-core', 'api'), 'autotunex.ts')
+    assert.ok(api, 'api/autotunex.ts should exist')
+    const getJob = stripComments(api).match(/export async function getJob\([\s\S]*?\n\}/)
+    assert.ok(getJob, 'getJob should exist')
+    assert.ok(!getJob[0].includes('shape=lean'), 'getJob should not request the lean shape')
+  })
+})
+
+describe('the Results tab on the build page', () => {
+  it('AutoTuneXResultsPanel reuses the tuning page\'s TuningResultsPanel', () => {
+    const panels = stripComments(read(BUILD_PAGE, 'AutoTuneXJobPanels.tsx'))
+    assert.ok(panels, 'AutoTuneXJobPanels.tsx should exist')
+    assert.match(panels, /export function AutoTuneXResultsPanel\(/, 'AutoTuneXResultsPanel should be exported')
+    assert.match(
+      panels,
+      /<TuningResultsPanel\s+jobId=\{job\.id\}\s+jobStatus=\{job\.status\}\s*\/>/,
+      'the build page should render the same Results panel as the tuning page, not a copy',
+    )
+  })
+
+  it('the Results tab is gated on a completed tuning job', () => {
+    const details = stripComments(read(BUILD_PAGE, 'BuildDetails.tsx'))
+    assert.ok(details, 'BuildDetails.tsx should exist')
+    assert.match(
+      details,
+      /const resultsJob = tuningJob\?\.status === 'completed' \? tuningJob : null/,
+      'results only exist once the tuning job completes',
+    )
+    assert.match(details, /<Tab style=\{\{ display: resultsHide \}\}>Results<\/Tab>/, 'the tab should hide until then')
+    // Carbon mounts every TabPanel, so an unguarded panel would request assets on
+    // every build page.
+    assert.match(
+      details,
+      /\{resultsJob && <AutoTuneXResultsPanel job=\{resultsJob\} \/>\}/,
+      'the panel should only mount for a completed job',
+    )
+  })
+
+  it('the Results tab and its panel sit in the same position', () => {
+    // Carbon pairs tabs with panels by index. A Results tab listed after Tuning
+    // Logs with its panel listed before would open the wrong pane.
+    const details = stripComments(read(BUILD_PAGE, 'BuildDetails.tsx'))
+    assert.ok(details, 'BuildDetails.tsx should exist')
+    const logsTab = details.indexOf('>Tuning Logs</Tab>')
+    const resultsTab = details.indexOf('>Results</Tab>')
+    const logsPanel = details.indexOf('<AutoTuneXLogsPanel')
+    const resultsPanel = details.indexOf('<AutoTuneXResultsPanel')
+    assert.ok(logsTab > -1 && resultsTab > -1 && logsPanel > -1 && resultsPanel > -1, 'all four markers should exist')
+    assert.ok(resultsTab > logsTab, 'the Results tab should come after Tuning Logs')
+    assert.ok(resultsPanel > logsPanel, 'the Results panel should come after the Tuning Logs panel')
+  })
+})

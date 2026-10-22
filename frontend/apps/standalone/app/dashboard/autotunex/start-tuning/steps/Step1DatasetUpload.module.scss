@@ -1,0 +1,177 @@
+.settingsColumn {
+  flex: 0 0 380px;
+  min-width: 300px;
+}
+
+.previewColumn {
+  flex: 1 1 480px;
+  min-width: 0;
+}
+
+.tileHeading {
+  font-weight: 600;
+  margin: 0 0 1.25rem;
+}
+
+.sectionTitle {
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.32px;
+  color: var(--cds-text-secondary, #525252);
+  margin: 0 0 0.5rem;
+}
+
+.nameField {
+  margin-bottom: 0.75rem;
+}
+
+.splitToggleRow {
+  margin-bottom: 1rem;
+}
+
+.toggleLabelRow {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  margin-bottom: 0.25rem;
+  font-size: 0.75rem;
+  color: var(--cds-text-secondary, #525252);
+}
+
+.sectionDivider {
+  border: none;
+  border-top: 1px solid var(--cds-border-subtle, #e0e0e0);
+  margin: 1.25rem 0;
+}
+
+.helperTextInline {
+  font-size: 0.8125rem;
+  color: var(--cds-text-secondary, #525252);
+}
+
+.mappingHeader {
+  display: grid;
+  grid-template-columns: 160px 1fr;
+  gap: 0.75rem;
+  font-size: 0.75rem;
+  color: var(--cds-text-secondary, #525252);
+  padding-bottom: 0.375rem;
+  margin-bottom: 0.5rem;
+}
+
+.mappingRow {
+  display: grid;
+  grid-template-columns: 160px 1fr;
+  gap: 0.75rem;
+  align-items: end;
+  margin-bottom: 1rem;
+}
+
+.mappingLabel {
+  font-size: 0.875rem;
+  font-weight: 500;
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  height: 2rem;
+}
+
+.requiredMarker {
+  color: var(--cds-support-error, #da1e28);
+}
+
+.exampleCode {
+  background: var(--cds-background-inverse, #262626);
+  color: var(--cds-text-on-color, #f4f4f4);
+  padding: 0.75rem 1rem;
+  border-radius: 4px;
+  font-size: 0.8125rem;
+  font-family: 'IBM Plex Mono', monospace;
+  line-height: 1.5;
+  overflow-x: auto;
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.dropZone {
+  border: 2px dashed var(--cds-icon-disabled, #a8a8a8);
+  border-radius: 4px;
+  padding: 1.5rem;
+  text-align: center;
+}
+
+.dropZoneHint {
+  font-size: 0.75rem;
+  color: var(--cds-text-secondary, #525252);
+  margin: 0.5rem 0 0;
+}
+
+.emptyStateHint {
+  color: var(--cds-text-secondary, #525252);
+  font-size: 0.8125rem;
+  margin-top: 1rem;
+  text-align: center;
+}
+
+.previewTile {
+  padding: 1.25rem;
+  max-height: calc(100vh - 16rem);
+  overflow: auto;
+}
+
+// Stacked, not a `120px 1fr` grid: Carbon's file item will not shrink below its
+// filename, so a name wider than the 1fr track ran off the tile edge. Same cause
+// and fix as the HF import form's Dataset row (see HfImportForm.module.scss).
+.fileRow {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.fileLabel {
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.32px;
+  color: var(--cds-text-secondary, #525252);
+  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+// A filename wider than the tile still overflows once stacked, since both elements
+// Carbon renders it into carry `white-space: nowrap`. Wrap it instead; `anywhere`
+// because `customer_support_validation.parquet` has no break opportunity. The
+// `<button>` variant centres its text by UA default, which leaves a ragged second line.
+.fileRow :global(.cds--file__selected-file .cds--file-filename),
+.fileRow :global(.cds--file__selected-file .cds--file-filename-button) {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  text-align: start;
+}
+
+.aiTagButton {
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+}
+
+// Carbon gives every switch `inline-size: 100%`, so as equal-basis flex items the
+// three tabs each take exactly a third of the 340px settings tile -- 81px of label
+// room once the 16px inline padding is taken off. "Select Existing" needs 94px and
+// "HuggingFace" 83px, so both ellipsized regardless of how much room the short
+// "Upload" tab was wasting. `max-content` sizes each tab to its own label instead.
+//
+// `flex-grow` is the other half of the fix, not a flourish: at max-content the three
+// tabs come to 319px and `justify-content: space-evenly` on the switcher would spend
+// the leftover 21px as gaps *between* the segments, splitting the connected pill into
+// three floating buttons. Growing them consumes it inside the segments.
+//
+// Both tabs still ellipsize if the column is ever narrowed enough, but they now
+// shrink in proportion to their own text rather than all being clamped to a third.
+.sourceSwitcher :global(.cds--content-switcher-btn) {
+  flex-basis: max-content;
+  flex-grow: 1;
+}

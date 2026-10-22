@@ -1,0 +1,19 @@
+.logViewer {
+  max-height: 70vh;
+  overflow-y: auto;
+  // Contextual tokens, not hex: #f4f4f4 is the g10 page background, so on a
+  // page the log had no edge, and in g100 it stayed a light panel on a dark one.
+  // A caller already on a layer wraps this in <Layer> (see TrialsTable).
+  background-color: var(--cds-layer);
+  color: var(--cds-text-primary);
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.75rem;
+  line-height: 1.4;
+  padding: 0.5rem 1rem;
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+
+.logLine {
+  padding: 2px 0;
+}

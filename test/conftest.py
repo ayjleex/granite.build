@@ -56,8 +56,14 @@ if not _can_import("asyncssh"):
     collect_ignore.append("integration/ibm/utils/test_ssh_tunnel.py")
 
 
+# Before importing gbserver (below): loads the local test PostgreSQL's
+# GBSERVER_SQL_* settings in STANDALONE runs, which gbserver reads at import.
+import libgbtest.local_postgres  # noqa: E402  # isort: skip
+
+
 import libgbtest
 import libgbtest.constants
+from libgbtest import abort_cleanup, xdist_groups
 from libgbtest.constants import BUILD_ID_PATTERN
 
 import gbserver.types.constants
@@ -104,7 +110,6 @@ TEST_REQUIRED_ENV_VARS = [
     "GBSERVER_SQL_SSLROOT_CERT_BASE64",
     "GITHUB_TOKEN",
     "IBM_CLOUD_API_KEY",
-    "LAKEHOUSE_TOKEN",
     "HF_TOKEN",
     # GB Test Secrets
     "GBTEST_GB_CLUSTER_API_KEY",
@@ -132,7 +137,6 @@ TEST_ENV_VAR_SPS_NAMES["GBSERVER_SQL_PASSWD"] = "gbserver-sql-passwd"
 TEST_ENV_VAR_SPS_NAMES["GBSERVER_SQL_SSLROOT_CERT_BASE64"] = (
     "gbserver-sql-sslroot-cert-base64"
 )
-TEST_ENV_VAR_SPS_NAMES["LAKEHOUSE_TOKEN"] = "lakehouse-token"
 # RIS3
 TEST_ENV_VAR_SPS_NAMES["IBM_CLOUD_API_KEY"] = "ris3-api-key"
 
@@ -144,10 +148,31 @@ TEST_ENV_VAR_SPS_NAMES["GBSERVER_WANDB_ENTITY"] = "gbserver-wandb-entry"
 TEST_ENV_VAR_SPS_NAMES["GBSERVER_WANDB_API_KEY"] = "gbserver-wandb-api-key"
 
 
+def _local_postgres_owns(env_var: str) -> bool:
+    """Whether a local test PostgreSQL's settings must win over SPS for ``env_var``.
+
+    While the local server's env is in effect (see libgbtest.local_postgres), the
+    SPS SQL secrets (the hosted database's password/cert) must not replace its
+    GBSERVER_SQL_* values.
+
+    Args:
+        env_var: Name of the environment variable being resolved.
+
+    Returns:
+        True if ``env_var`` is a GBSERVER_SQL_* setting and the local server is in use.
+    """
+    return (
+        env_var.startswith("GBSERVER_SQL_")
+        and libgbtest.local_postgres.GBTEST_LOCAL_POSTGRES
+    )
+
+
 # Set each required environment variable, either from value or secret manager
 def set_test_env(sps_api_key: str, enable_env_var_override: bool):
     """Set up the test env vars using one of 1) local env vars, 2) default values or 3) sps secrets.
     if enable_env_var_override is True, then let local env vars supersede secret values.
+    Local GBSERVER_SQL_* values always supersede them while a local test PostgreSQL
+    is in use (see _local_postgres_owns).
 
     Args:
         sps_api_key (str): _description_
@@ -166,7 +191,9 @@ def set_test_env(sps_api_key: str, enable_env_var_override: bool):
         env_var_value = os.getenv(env_var, None)
         if env_var in TEST_ENV_VAR_SPS_NAMES:
             # Handle secrets
-            if env_var_value is not None and enable_env_var_override:
+            if env_var_value is not None and (
+                enable_env_var_override or _local_postgres_owns(env_var)
+            ):
                 value = env_var_value
                 value_source = "Local Environment"
             else:
@@ -321,6 +348,12 @@ def pytest_sessionstart(session):
     before performing collection and entering the run test loop.
     """
     from libgbtest.mode import get_test_mode
+
+    if libgbtest.local_postgres.LOADED_ENV_FILE is not None:
+        logger.info(
+            "Loaded local test PostgreSQL settings from %s",
+            libgbtest.local_postgres.LOADED_ENV_FILE,
+        )
 
     test_mode = get_test_mode()
     logger.info(f"GBTEST_MODE={test_mode}")
@@ -512,9 +545,43 @@ def _arm_stall_watchdog() -> None:
     )
 
 
+# Handlers SIGTERM / SIGHUP had before pytest_configure mapped them to SIGINT's.
+_PREVIOUS_SIGNAL_HANDLERS: dict = {}
+
+
 def pytest_configure(config):
-    """Arm the stall watchdog (controller and each xdist worker)."""
+    """Arm the stall watchdog and SIGTERM-as-SIGINT (controller and each xdist worker).
+
+    SIGTERM / SIGHUP otherwise kill pytest without running teardown, leaking the
+    remote resources tests clean up there; see libgbtest.abort_cleanup.
+    """
     _arm_stall_watchdog()
+    _PREVIOUS_SIGNAL_HANDLERS.update(abort_cleanup.map_termination_signals_to_sigint())
+
+
+def pytest_unconfigure(config):
+    """Restore the signal handlers pytest_configure replaced."""
+    abort_cleanup.restore_signal_handlers(_PREVIOUS_SIGNAL_HANDLERS)
+    _PREVIOUS_SIGNAL_HANDLERS.clear()
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_collection_modifyitems(config, items):
+    """Serialize the SkyPilot tests. tryfirst: xdist reads the groups after."""
+    xdist_groups.group_skypilot_integration_tests(
+        items, strict=xdist_groups.is_loadgroup(config)
+    )
+
+
+@pytest.hookimpl(tryfirst=True, optionalhook=True)
+def pytest_timeout_set_timer(item, settings):
+    """Record when pytest-timeout fires for ``item``, as it starts the timer.
+
+    Build tests use it to keep their own waits shorter and to clean up before the
+    thread method's ``os._exit`` (see libgbtest.abort_cleanup). Returns None so
+    pytest-timeout's own hook still sets the timer.
+    """
+    abort_cleanup.record_timeout_deadline(item, settings)
 
 
 def pytest_runtest_logreport(report):
@@ -680,10 +747,6 @@ def _mock_github_auth(request):
             "libgbtest.api.utils.get_gh_user",
             return_value=(fake_user, ""),
         ),
-        patch(
-            "integration.ibm.api.test_spaces.get_gh_user",
-            return_value=(fake_user, ""),
-        ),
     ):
         yield
 
@@ -769,16 +832,33 @@ def _mock_git_uri_branch_check(request):
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture
+def allow_bash_environment():
+    """Allow constructing the Bash environment in a non-STANDALONE test run.
+
+    Bash refuses to run outside a STANDALONE server (it executes step commands
+    on the server host). Tests run as GB_ENVIRONMENT=DEV, so a test that builds
+    a Bash instance directly opts in with
+    ``pytestmark = pytest.mark.usefixtures("allow_bash_environment")``.
+    """
+    with patch("gbserver.environment.bash.is_standalone", return_value=True):
+        yield
+
+
 @pytest.fixture(autouse=True)
 def _mock_space_access(request):
-    """In mock mode, bypass space write-access checks."""
-    if should_use_live(request, "github"):
+    """In mock mode, bypass space write-access checks.
+
+    Live for ``@pytest.mark.live("space_access")`` (real checks, other GitHub mocks
+    kept) or ``"github"`` (everything GitHub real).
+    """
+    if should_use_live(request, "github") or should_use_live(request, "space_access"):
         yield
         return
 
     with (
         patch(
-            "gbserver.api.utils.has_space_write_access",
+            "gbserver.api.utils._has_existing_item_write_access",
             return_value=(True, "standalone"),
         ),
         patch(
@@ -786,7 +866,7 @@ def _mock_space_access(request):
             return_value=True,
         ),
         patch(
-            "gbserver.api.artifacts.confirm_space_write_access",
+            "gbserver.api.artifacts.confirm_existing_item_write_access",
             return_value=None,
         ),
         patch(
@@ -794,7 +874,7 @@ def _mock_space_access(request):
             return_value=True,
         ),
         patch(
-            "gbserver.api.builds.confirm_space_write_access",
+            "gbserver.api.builds.confirm_existing_item_write_access",
             return_value=None,
         ),
     ):
@@ -919,10 +999,6 @@ def _mock_lineage(request):
     with (
         patch("gbserver.lineage.jobstats.get_lineage_store", return_value=mock_store),
         patch("gbserver.api.artifacts.get_lineage_store", return_value=mock_store),
-        patch(
-            "integration.ibm.api.test_artifacts.get_lineage_store",
-            return_value=mock_store,
-        ),
     ):
         yield
 

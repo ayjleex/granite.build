@@ -150,6 +150,76 @@ function MyBuildsTile() {
     </BaseTile>
   );
 }
+// ── AutoTuneX tiles ─────────────────────────────────────────────────────
+
+// A build counts as model-customisation activity when it carries this tag. This
+// tile stays tag-based on purpose: it's a system-wide aggregate (one listBuilds
+// call per tag below), and asking the authoritative per-build endpoint instead
+// would mean one request per build rather than one per tag. The build page
+// itself no longer uses tags — it asks
+// GET /jobs/by-build-id. The tag is AutoTuneX's `gb_tags` default, so the two
+// agree out of the box; they disagree, with this tile undercounting, for builds
+// tagged before that default changed from `autotunex`, and on a deployment that
+// sets AUTOTUNEX_GB_TAGS to something else.
+const MODEL_CUSTOMISATION_TAGS = [
+  "model-customization"
+];
+
+// The gbserver tags filter is AND-only, so one tag per request, then dedupe by
+// uuid (with more than one tag listed, a build carrying two would otherwise be
+// counted twice).
+async function fetchModelCustomisationStats() {
+  const results = await Promise.all(
+    MODEL_CUSTOMISATION_TAGS.map((tag) => listBuilds({ tags: [tag] })),
+  );
+  const byId = new Map<string, Build>();
+  for (const r of results) for (const b of r.items) byId.set(b.uuid, b);
+  const builds = Array.from(byId.values());
+
+  return {
+    total: builds.length,
+    running: builds.filter((b) => b.status === "running").length,
+    pending: builds.filter((b) => b.status === "pending" || b.status === "submitted").length,
+    completed: builds.filter((b) => b.status === "success").length,
+    failed: builds.filter((b) => b.status === "failed").length,
+    cancelled: builds.filter((b) => b.status === "cancelled").length,
+  };
+}
+
+function AutoTuneXTile() {
+  const startTuningLink = (
+    <Link
+      href="/dashboard/autotunex/start-tuning"
+      className="cds--link"
+      style={{ fontSize: "0.875rem" }}
+    >
+      Start tuning
+    </Link>
+  );
+
+  const { data: stats, isFetching, refetch } = useQuery({
+    queryKey: ["model-customisation-stats"],
+    queryFn: fetchModelCustomisationStats,
+  });
+  const [isRefreshing, markRefreshing] = useRefreshState(isFetching);
+  return (
+    <BaseTile
+      title="Model Customization"
+      action={startTuningLink}
+      isRefreshing={isRefreshing}
+      onRefresh={() => { markRefreshing(); void refetch() }}
+    >
+      <div style={{ display: "flex", flexDirection: "column", gap: "0.375rem" }}>
+        <StatRow label="Total tunings" value={stats?.total ?? "—"} />
+        <StatRow label="Running" value={stats?.running ?? "—"} />
+        <StatRow label="Pending" value={stats?.pending ?? "—"} />
+        <StatRow label="Completed" value={stats?.completed ?? "—"} />
+        <StatRow label="Cancelled" value={stats?.cancelled ?? "—"} />
+        <StatRow label="Failed" value={stats?.failed ?? "—"} />
+      </div>
+    </BaseTile>
+  );
+}
 
 function ClusterStatusTile() {
   const { data: todayData, isFetching, refetch } = useQuery({
@@ -598,13 +668,14 @@ export default function HomePage() {
       <div
         style={{
           display: "grid",
-          gridTemplateColumns: "repeat(4, 1fr)",
+          gridTemplateColumns: "repeat(5, 1fr)",
           gap: "1rem",
           marginBottom: "1rem",
           alignItems: "stretch",
         }}
       >
         <MyBuildsTile />
+        <AutoTuneXTile />
         <ClusterStatusTile />
         <SpacesOverviewTile />
         <BuildStatsTile />

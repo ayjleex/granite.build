@@ -1,0 +1,616 @@
+'use client'
+
+import { Fragment, useMemo, useRef, useState } from 'react'
+import type { CSSProperties } from 'react'
+import {
+  DataTable,
+  Table,
+  TableContainer,
+  TableToolbar,
+  TableToolbarContent,
+  TableToolbarSearch,
+  TableHead,
+  TableRow,
+  TableHeader,
+  TableBody,
+  TableCell,
+  TableSelectAll,
+  TableSelectRow,
+  TableExpandHeader,
+  TableExpandRow,
+  TableExpandedRow,
+  Tabs,
+  TabList,
+  Tab,
+  TabPanels,
+  TabPanel,
+  CodeSnippet,
+  Layer,
+  Button,
+  InlineNotification,
+  InlineLoading,
+  Pagination,
+} from '@carbon/react'
+import { ArrowLeft, Compare } from '@carbon/icons-react'
+import { useQuery } from '@tanstack/react-query'
+import { useChartsTheme } from '../../../hooks/useTheme'
+import { getJobTrials } from '../../../api/autotunex'
+import { useAutotunexIsAdmin } from '../../../hooks/useAutotunexIsAdmin'
+import { TrialLogViewer } from './TrialLogViewer'
+import { TrialCompare } from './TrialCompare'
+import { TrialProgressSummary } from './TrialProgressSummary'
+import { TrialMetricsCharts } from './TrialMetricsCharts'
+import { TrialMetricsPanel } from './TrialMetricsPanel'
+import { TrialSearchSpace } from './TrialSearchSpace'
+import { EMPHASIS_THRESHOLD, emphasisColorScale, selectionSlots, trialColorScale } from './trialMetrics'
+import { formatCell } from './trialsTableFormat'
+import { formatHyperparamValue, hyperparamColumnLabel, hyperparamColumns } from './trialHyperparams'
+import { bestTrialId, isLowerBetter, jobMetric, rankBestFirst, scoreOn, toFeatureLabel } from './trialsRadar'
+import type { JobDetail, Trial } from '../../../types'
+
+// Hyperparameter columns are appended to these at render time. Appended, not
+// inserted: cause-then-effect would read more naturally, but on a wide sweep it
+// pushes Loss and Total time off the right edge — losing the comparison the columns
+// exist for. These four keep their positions and the rest scroll.
+const BASE_HEADERS = [
+  { key: 'id', header: 'Trial id' },
+  { key: 'status', header: 'Status' },
+  { key: 'loss', header: 'Loss' },
+  { key: 'total_time', header: 'Total time' },
+]
+
+// Poll while the run can still produce trials, at the same 15s cadence
+// TuningDetailPageClient polls the job itself, so the table and the page header
+// advance together.
+const ACTIVE_STATUSES = new Set(['running', 'pending'])
+
+// At most this many trials in one comparison. The ceiling is the palette's:
+// EMPHASIS_THRESHOLD marks where METRIC_PALETTE runs out of hues, so a wider
+// selection would have to draw two curves in the same colour — and ten
+// overlapping curves is already about the limit for reading a line chart.
+//
+// The cap alone does not keep a selection distinct: in a job past
+// EMPHASIS_THRESHOLD trials the palette wraps and trial 11's home hue is trial 1's.
+// A ticked trial whose home hue is taken borrows a free one instead — see
+// selectionSlots — and because the cap is the palette size, one is always free.
+const MAX_SELECTED = EMPHASIS_THRESHOLD
+
+// Same page sizes as the other AutoTuneX tables. The pager only appears once a job
+// has more trials than the smallest page holds.
+const PAGE_SIZES = [10, 20, 50]
+
+interface Props {
+  job: JobDetail
+}
+
+export function TrialsTable({ job }: Props) {
+  const jobId = job.id
+  const [selectedIds, setSelectedIds] = useState<string[]>([])
+  const [showCompare, setShowCompare] = useState(false)
+  const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = useState(PAGE_SIZES[0])
+  const theme = useChartsTheme()
+
+  // Same cached admin check the rest of the detail view uses to pick a scope —
+  // AutoTuneX admins read `scope=all` so they can see trials for jobs they don't
+  // own. No extra fetch: React Query dedupes on the shared key.
+  const { isAdmin } = useAutotunexIsAdmin()
+  const scope = isAdmin ? 'all' : 'own'
+
+  // Trials come from GET /jobs/{id}/trials — the job detail no longer nests them.
+  // No `enabled` gate: a non-HPO job just returns an empty page, and Carbon
+  // mounts every tab panel regardless of which tab is active.
+  const {
+    data: trials = [],
+    isLoading,
+    isError,
+    error,
+  } = useQuery({
+    queryKey: ['autotunex-job-trials', jobId, scope],
+    queryFn: () => getJobTrials(jobId, scope),
+    refetchInterval: ACTIVE_STATUSES.has(job.status) ? 15_000 : false,
+  })
+
+  // One colour per run, assigned by creation order and keyed by id, so the
+  // charts above and a row's own Metrics tab agree — and so hiding a series in
+  // the chart legend never repaints the others. Built here rather than in either
+  // consumer because both need the identical map.
+  // Computed once and shared: the emphasis form below keeps this run in colour,
+  // and the compare view tags it. Reading it twice would let the tag crown a trial
+  // the charts colour as an also-ran if the two ever fell out of step.
+  const bestId = bestTrialId(trials)
+  const orderedIds = useMemo(
+    () =>
+      [...trials]
+        .sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at))
+        .map((t) => t.id),
+    [trials]
+  )
+  // The ticked trials' slots, sticky across selection changes — see
+  // selectionSlots. The previous result lives in a ref because the next one is
+  // derived from it; recomputing from the selection alone would hand a borrowed
+  // slot back the moment its home freed up, repainting a curve under the reader.
+  // Written during render, which is safe here because the result is a pure
+  // function of (previous, orderedIds, selectedIds): a render React discards
+  // leaves behind only slots the next render with the same selection would pick.
+  const slotsRef = useRef<Record<string, number>>({})
+  const slots = useMemo(() => {
+    slotsRef.current = selectionSlots(orderedIds, selectedIds, slotsRef.current)
+    return slotsRef.current
+  }, [orderedIds, selectedIds])
+  const colorScale = useMemo(() => trialColorScale(orderedIds, theme, slots), [orderedIds, theme, slots])
+  // With nothing ticked and no final run, the charts fall back to drawing every
+  // trial the table lists. Past EMPHASIS_THRESHOLD trials the home hues repeat
+  // there, pairing trials that have nothing to do with each other, so that view
+  // alone greys all but the best. A tick switches back to the full scale, where
+  // selectionSlots keeps the ticked trials distinct.
+  const chartsColorScale = useMemo(
+    () =>
+      selectedIds.length === 0 && trials.length > EMPHASIS_THRESHOLD
+        ? emphasisColorScale(colorScale, bestId, theme)
+        : colorScale,
+    [selectedIds.length, trials.length, colorScale, bestId, theme]
+  )
+
+  // Every top-level hyperparameter on a trial's config, ignoring tuner_flags — see
+  // hyperparamColumns. Empty for a job whose trials carry no top-level
+  // hyperparameters, in which case the table renders exactly as it did before this
+  // feature.
+  const hyperparamKeys = useMemo(() => hyperparamColumns(trials), [trials])
+
+  // The column is keyed `loss` for formatCell and the default sort, but holds the
+  // job's metric, so it is labelled with it: a reward job's 0.91 under "Loss"
+  // read as a bad loss.
+  const metric = jobMetric(trials)
+  // The metric the job scores its trials on, and whether smaller is better. The
+  // same `jobMetric` `bestTrialId` ranks on, so the plot's better-is-up axes cannot
+  // disagree with which trial it marks as best. Not read per trial: `primaryMetric`
+  // falls back to `loss` for a trial whose own metric is absent, which made a
+  // reward job whose first trial had only a loss plot as lower-is-better. A hook,
+  // and up here with the others rather than beside its use below, because the
+  // early returns follow.
+  const plotMetric = useMemo(() => ({ name: metric, lowerIsBetter: isLowerBetter(metric) }), [metric])
+  const tableHeaders = useMemo(
+    () => [
+      ...BASE_HEADERS.map((h) => (h.key === 'loss' ? { ...h, header: toFeatureLabel(metric) } : h)),
+      ...hyperparamKeys.map((key) => ({ key, header: hyperparamColumnLabel(key) })),
+    ],
+    [hyperparamKeys, metric]
+  )
+
+  // The cell render and the toolbar filter must agree, or search matches text the
+  // cells do not show. Both go through this.
+  const cellText = (key: string, value: unknown) =>
+    hyperparamKeys.includes(key) ? formatHyperparamValue(value) : formatCell(key, value)
+
+  if (isLoading) {
+    return <InlineLoading description="Loading trials…" />
+  }
+
+  if (isError) {
+    return (
+      <InlineNotification
+        kind="error"
+        title="Failed to load trials"
+        subtitle={String(error)}
+        hideCloseButton
+      />
+    )
+  }
+
+  if (trials.length === 0) {
+    // Still show progress here when the job declared a planned total: "12 queued"
+    // before any trial row exists is exactly what users were missing.
+    //
+    // The charts still render: a run with no search trials (a plain tuning job,
+    // or an HPO run whose trials have not been written yet) can already be
+    // logging steps, and `derivePhases` attributes those rows to the single
+    // training run — which is exactly what they are.
+    return (
+      <div>
+        <TrialProgressSummary job={job} trials={trials} />
+        <InlineNotification kind="info" title="No trial data available" hideCloseButton />
+        {/* No rows here means no Cancel button, so a selection carried in from a
+            page that did have rows would hide the final run with nothing on
+            screen able to clear it. There is nothing here to tick, so nothing
+            counts as ticked. The mirror itself is left alone rather than reset,
+            so a selection survives a query that comes back empty in passing. */}
+        <TrialMetricsCharts
+          job={job}
+          trials={trials}
+          trialsLoaded={!isLoading && !isError}
+          colorScale={colorScale}
+          selectedIds={[]}
+          scope={scope}
+        />
+      </div>
+    )
+  }
+
+  // Full-screen compare view: replaces the table + radar, mirroring AutoTuneX.
+  const selectedForCompare = trials.filter(
+    (t) => selectedIds.includes(t.id) && t.status === 'completed' && Object.keys(t.metrics ?? {}).length > 0
+  )
+  if (showCompare && selectedForCompare.length > 0) {
+    return (
+      <div>
+        <Button
+          kind="ghost"
+          size="sm"
+          renderIcon={ArrowLeft}
+          // Keep the selection on the way back. A reader who narrows a
+          // comparison and returns to adjust it should not have to re-tick every
+          // row. This used to clear the mirror because Carbon's DataTable keeps
+          // its own checkbox state and a fresh one mounts unticked — which would
+          // strand the Compare button and the radar on screen above visibly
+          // empty checkboxes. The rows now carry `isSelected`, so the remounted
+          // table comes up matching the mirror instead. Cancel in the toolbar is
+          // how a reader clears it.
+          onClick={() => setShowCompare(false)}
+          style={{ marginBottom: '1rem' }}
+        >
+          Back to Hyperparameters
+        </Button>
+        <TrialCompare
+          trials={selectedForCompare}
+          // Removal drops the trial from the shared selection, so the compare
+          // view and the table's checkboxes cannot disagree. Carbon's DataTable
+          // is unmounted while this view is up, so there is no internal
+          // checkbox state to keep in step — and Back clears the mirror anyway.
+          // TrialCompare stops offering removal at two, so this can never empty
+          // the view out from under the reader.
+          onRemove={(id) => setSelectedIds((prev) => prev.filter((selected) => selected !== id))}
+          // The job's winner, not the leading column — a comparison that leaves
+          // it out shows no tag rather than promoting the better of two.
+          bestTrialId={bestId}
+        />
+      </div>
+    )
+  }
+
+  // Default order: lowest loss first — trials without a loss sink to the end.
+  //
+  // `isSelected` seeds Carbon's own checkbox state. Carbon reads it off the row
+  // only when it has no prior state to preserve — on mount, since `normalize`
+  // otherwise takes the value from `prevRowsByIds` — so this restores a
+  // selection across a remount without contesting ownership of it afterwards.
+  // That is what lets Back keep the selection: the compare view unmounts this
+  // table, so returning mounts a fresh one that would come up unticked.
+
+  // Best first on the job's metric -- the same ranking bestTrialId and Compare use.
+  const rows = rankBestFirst(trials)
+    .map((t) => ({
+      id: t.id,
+      status: t.status,
+      // The value the ranking used, so the cell and the order agree: a trial with
+      // no value on the job's metric shows none, rather than the loss it fell back
+      // to under the job's metric heading -- see scoreOn.
+      loss: scoreOn(t, metric) ?? undefined,
+      total_time: t.metrics?.total_time,
+      isSelected: selectedIds.includes(t.id),
+      // Raw values, not formatted text: Carbon's default comparator does `a - b`
+      // for two numbers (DataTable/tools/sorting.js), so `r: 16` sorts after
+      // `r: 8`; handed strings it would fall back to localeCompare. Same reason
+      // `loss` and `total_time` are raw. Spread last, which is safe because
+      // hyperparamColumns excludes the keys above.
+      ...Object.fromEntries(hyperparamKeys.map((key) => [key, ((t.config ?? {}) as Record<string, unknown>)[key]])),
+    }))
+
+  // Only completed trials with metrics can be plotted — running/errored trials
+  // have no (or partial) metrics.
+  const plottableTrials = trials.filter(
+    (t) => t.status === 'completed' && Object.keys(t.metrics ?? {}).length > 0
+  )
+  const comparableTrials = plottableTrials.filter((t) => selectedIds.includes(t.id))
+  // The parallel plot draws the ticked trials and nothing else — with no selection
+  // the section is absent. With two or more ticked,
+  // the axes span only those trials: one outlier elsewhere in the run would otherwise
+  // stretch an axis — Loss above all — until every drawn line bunched at one end and
+  // the winner could not be told apart. The cost is that ticking a trial on or off
+  // rescales the axes. One ticked trial keeps the run's scale, since its own scale
+  // has zero width and would pin it to the top of every axis.
+  const parallelTrials = comparableTrials
+  const parallelBounds = parallelTrials.length >= 2 ? parallelTrials : plottableTrials
+
+  // The diff-table only needs 2+ completed trials with a score — no axis constraint.
+  const canOpenCompare = comparableTrials.length >= 2
+  const atSelectionCap = selectedIds.length >= MAX_SELECTED
+
+  const trialsById = new Map(trials.map((t) => [t.id, t]))
+
+  // Client-side: every trial is already loaded, and Carbon has sorted and
+  // filtered them by the time they reach the render prop, so a page is a slice of
+  // that. Only the rendered rows are paged — selection, select-all and Cancel still
+  // act on every filtered row, on any page.
+  const showPagination = trials.length > PAGE_SIZES[0]
+
+  return (
+    <div>
+      <TrialProgressSummary job={job} trials={trials} />
+      {/* Table first, the parallel plot stacked under it once a plottable trial is
+          ticked, so each one gets the row's full width. `overflowX: 'auto'` keeps a wide
+          table scrolling inside its own box rather than stretching the page. */}
+      <div style={{ overflowX: 'auto' }}>
+      <DataTable
+        rows={rows}
+        headers={tableHeaders}
+        isSortable
+        // Carbon's default filter matches String(cell.value), but these cells
+        // render formatted text — so "5m 20" would miss the row showing
+        // "5m 20s" over a raw 320. Same shape as Carbon's defaultFilterRows
+        // with formatCell in place of String(). Typed contextually from the
+        // prop, so no annotation is needed here.
+        filterRows={({ rowIds, headers, cellsById, inputValue, getCellId }) => {
+          const query = inputValue.trim().toLowerCase()
+          if (!query) return rowIds
+          return rowIds.filter((rowId) =>
+            headers.some(({ key }) =>
+              cellText(key, cellsById[getCellId(rowId, key)].value).toLowerCase().includes(query)
+            )
+          )
+        }}
+      >
+        {({ rows: tableRows, headers, getTableProps, getHeaderProps, getRowProps, getExpandedRowProps, getSelectionProps, onInputChange, selectRow, selectedRows }) => (
+          <TableContainer>
+            <TableToolbar>
+              <TableToolbarContent>
+                <TableToolbarSearch
+                  persistent
+                  placeholder="Search trials…"
+                  // Back to the first page, or a search that narrows the rows
+                  // could leave the reader on a page past the last one.
+                  onChange={(e, value) => {
+                    setPage(1)
+                    onInputChange(e, value)
+                  }}
+                  aria-label="Search trials"
+                />
+                {trials.length > MAX_SELECTED && (
+                  // Explains both disabled states below — the capped row
+                  // checkboxes and the withheld select-all — neither of which
+                  // Carbon can annotate itself.
+                  <span
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      padding: '0 1rem',
+                      fontSize: '0.75rem',
+                      color: 'var(--cds-text-secondary)',
+                      whiteSpace: 'nowrap',
+                    }}
+                  >
+                    {selectedIds.length} of {MAX_SELECTED} selected
+                    {atSelectionCap && ' — clear one to pick another'}
+                  </span>
+                )}
+                {selectedIds.length > 0 && (
+                  <Button
+                    kind="ghost"
+                    // Clear both copies of the selection from Carbon's own list,
+                    // not from `selectedIds`. selectRow toggles a row, so driving
+                    // it from the mirror would invert the selection if the two
+                    // ever drifted. Rows now carry `isSelected`, which re-seeds
+                    // Carbon from the mirror on every remount — the isLoading /
+                    // isError / no-trials returns above unmount the DataTable
+                    // while this component and the mirror stay alive — so that
+                    // known drift is closed; reading Carbon's own list remains
+                    // the right thing to do regardless of who drifted.
+                    // selectedRows spans every row, not just the filtered ones
+                    // (DataTable.js:256), so Cancel still ignores the search.
+                    onClick={() => {
+                      selectedRows.forEach(({ id }) => selectRow(id))
+                      setSelectedIds([])
+                    }}
+                  >
+                    Cancel
+                  </Button>
+                )}
+                {canOpenCompare && (
+                  <Button renderIcon={Compare} onClick={() => setShowCompare(true)}>
+                    Compare
+                  </Button>
+                )}
+              </TableToolbarContent>
+            </TableToolbar>
+            <Table {...getTableProps()} size="sm">
+              <TableHead>
+                <TableRow>
+                  <TableExpandHeader aria-label="Expand row" />
+                  <TableSelectAll
+                    {...getSelectionProps()}
+                    // Carbon's handleSelectAll ticks every filtered row in one
+                    // go, which would sail past MAX_SELECTED and leave Carbon's
+                    // own list holding rows the mirror refused — exactly the
+                    // desync the comment below is written to avoid. So it is
+                    // offered only when it cannot overshoot. Clearing stays
+                    // available: Carbon deselects whenever anything is already
+                    // selected (DataTable.js:303), so a non-empty selection
+                    // makes this click a clear rather than an add.
+                    disabled={selectedIds.length === 0 && tableRows.length > MAX_SELECTED}
+                    onSelect={(e) => {
+                      getSelectionProps().onSelect(e)
+                      // Mirror Carbon's own scope, which is the *filtered* rows:
+                      // getUpdatedSelectionState (DataTable.js:276-279) only touches
+                      // rows matching an active search, so select-all must add just
+                      // the visible ids and deselect-all must remove just those.
+                      // Replacing the whole mirror instead would strand a row that
+                      // the search has hidden: Carbon keeps it selected while the
+                      // mirror forgets it, leaving a ticked checkbox that Compare
+                      // and the radar ignore and that Cancel is not shown to clear.
+                      // Carbon's handleSelectAll deselects whenever anything is
+                      // already selected (DataTable.js:303), so with a selected
+                      // row hidden by the search this click is a no-op the user
+                      // can repeat — Carbon's own semantics, not a desync.
+                      const { checked } = e.target as HTMLInputElement
+                      setSelectedIds((prev) =>
+                        checked
+                          ? [...new Set([...prev, ...tableRows.map((r) => r.id)])]
+                          : prev.filter((id) => !tableRows.some((r) => r.id === id))
+                      )
+                    }}
+                  />
+                  {(() => {
+                    const headerProps = headers.map((h) => getHeaderProps({ header: h }))
+                    // Carbon only marks a header as the active sort column once the user
+                    // clicks it — it has no notion that `rows` already arrived pre-sorted
+                    // best first. Until the user actually sorts something, show the Loss
+                    // header as the active sort column, ascending or descending by the
+                    // job metric's direction, so the arrow matches the real row order.
+                    const userHasSorted = headerProps.some((hp) => hp.isSortHeader)
+                    return headers.map((h, i) => {
+                      const { key: _k, ...hProps } = headerProps[i]
+                      const isDefaultLossSort = !userHasSorted && h.key === 'loss'
+                      return (
+                        <TableHeader
+                          key={h.key}
+                          {...hProps}
+                          isSortHeader={isDefaultLossSort ? true : hProps.isSortHeader}
+                          sortDirection={isDefaultLossSort ? (isLowerBetter(metric) ? 'ASC' : 'DESC') : hProps.sortDirection}
+                        >
+                          {h.header}
+                        </TableHeader>
+                      )
+                    })
+                  })()}
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                {(showPagination ? tableRows.slice((page - 1) * pageSize, page * pageSize) : tableRows).map((row) => {
+                  const { key: _k, ...rowProps } = getRowProps({ row })
+                  const selectionProps = getSelectionProps({ row })
+                  const trial = trialsById.get(row.id)
+                  return (
+                    <Fragment key={row.id}>
+                      <TableExpandRow
+                        {...rowProps}
+                        // Tint the ticked checkbox to match this trial's line in
+                        // the charts below. It rides on the <tr> because
+                        // TableSelectRow renders the checkbox cell itself and
+                        // forwards neither style nor arbitrary props — only a
+                        // single className, which cannot carry a per-trial value.
+                        // Nothing else in a row reads --cds-icon-primary: the
+                        // expand chevron is filled from --cds-layer-selected-inverse
+                        // and the data cells are text, and the expanded panel is a
+                        // sibling <tr>, not a child. The checkmark stays
+                        // --cds-icon-inverse, which clears 3:1 against all ten
+                        // palette hues in both themes — worst 3.33:1, on the
+                        // light theme's #b28600.
+                        //
+                        // Only while selected: Carbon draws the *unchecked* box's
+                        // border from the same token, so applying this
+                        // unconditionally would tint every empty checkbox too.
+                        // Keyed off the mirror rather than Carbon's own checked
+                        // state because the mirror is what the charts draw, and
+                        // matching the charts is the whole point.
+                        style={
+                          selectedIds.includes(row.id)
+                            ? ({ '--cds-icon-primary': colorScale[row.id] } as CSSProperties)
+                            : undefined
+                        }
+                      >
+                        <TableSelectRow
+                          {...selectionProps}
+                          // Nothing left to give: at the cap an unticked row
+                          // cannot be added, so the checkbox says so rather
+                          // than swallowing the click. Ticked rows stay live or
+                          // the reader would be stuck at ten with no way down.
+                          // Carbon puts no tooltip on a disabled checkbox, so
+                          // the toolbar carries the reason.
+                          disabled={atSelectionCap && !selectedIds.includes(row.id)}
+                          onSelect={(e) => {
+                            selectionProps.onSelect(e)
+                            const checked = (e.target as HTMLInputElement).checked
+                            setSelectedIds((prev) => (checked ? [...prev, row.id] : prev.filter((id) => id !== row.id)))
+                          }}
+                        />
+                        {row.cells.map((cell) => (
+                          <TableCell key={cell.id}>{cellText(cell.info.header, cell.value)}</TableCell>
+                        ))}
+                      </TableExpandRow>
+                      {row.isExpanded && trial && (
+                        <TableExpandedRow {...getExpandedRowProps({ row })} colSpan={headers.length + 2}>
+                          <Tabs>
+                            {/* Logs first: when a reader expands a trial they are
+                                usually chasing what it did or why it stopped, and
+                                the log is the only tab that answers that. */}
+                            <TabList aria-label="Trial detail tabs" contained>
+                              <Tab>Logs</Tab>
+                              <Tab>Configuration</Tab>
+                              <Tab>Metrics</Tab>
+                            </TabList>
+                            {/* A contained tab panel is already layer-01, the same
+                                `--cds-layer` the log and .cds--snippet paint with, so
+                                both blended into it. <Layer> moves them to layer-02,
+                                as in DefinitionPanel. */}
+                            <TabPanels>
+                              <TabPanel>
+                                <Layer>
+                                  <TrialLogViewer jobId={jobId} trialId={trial.id} status={trial.status} scope={scope} />
+                                </Layer>
+                              </TabPanel>
+                              <TabPanel>
+                                <Layer>
+                                  <CodeSnippet type="multi" wrapText>
+                                    {JSON.stringify(trial.config, null, 2)}
+                                  </CodeSnippet>
+                                </Layer>
+                              </TabPanel>
+                              <TabPanel>
+                                <TrialMetricsPanel
+                                  jobId={jobId}
+                                  trialId={trial.id}
+                                  status={trial.status}
+                                  color={colorScale[trial.id]}
+                                  scope={scope}
+                                />
+                              </TabPanel>
+                            </TabPanels>
+                          </Tabs>
+                        </TableExpandedRow>
+                      )}
+                    </Fragment>
+                  )
+                })}
+              </TableBody>
+            </Table>
+            {showPagination && (
+              <Pagination
+                totalItems={tableRows.length}
+                pageSize={pageSize}
+                page={page}
+                pageSizes={PAGE_SIZES}
+                onChange={({ page: p, pageSize: ps }) => {
+                  setPage(p)
+                  setPageSize(ps)
+                }}
+              />
+            )}
+          </TableContainer>
+        )}
+      </DataTable>
+      </div>
+
+      {parallelTrials.length > 0 && (
+        <div style={{ marginTop: '2rem' }}>
+          <TrialSearchSpace
+            trials={parallelTrials}
+            boundsFrom={parallelBounds}
+            hyperparamKeys={hyperparamKeys}
+            metric={plotMetric}
+            colorScale={colorScale}
+            bestTrialId={bestId}
+          />
+        </div>
+      )}
+
+      <TrialMetricsCharts
+        job={job}
+        trials={trials}
+        trialsLoaded={!isLoading && !isError}
+        colorScale={chartsColorScale}
+        selectedIds={selectedIds}
+        scope={scope}
+      />
+    </div>
+  )
+}

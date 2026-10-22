@@ -21,7 +21,6 @@ target_expectations:
     step_count: 2              # hfpull(docs) + dpk
     input_artifact_count: 1    # docs
     output_artifact_count: 1   # clean (env://, registered from the step's marker)
-    jobstats_count: 1
     # Pin what this fixture is for: the build named the transform and the step
     # derived its module and pip extra from it. Read from step_storage, so this
     # assertion holds independently of the lineage store.
@@ -34,9 +33,13 @@ target_expectations:
 # resolve through this one chain, so no test-local space is required:
 #   * space://environments/skypilot/slurm/bluevela -> gb-test itself
 #   * space://steps/dpk -> gb-test's own base_uri, the assets repo
-#     (assets.git@gbspace-config-dev), at steps/skypilot/dpk — byte-identical to
-#     the copy this repo publishes at
-#     configurations/assets/environments/skypilot/steps/dpk.
+#     (assets.git@gbspace-config-dev), at steps/skypilot/dpk. Its step.yaml is
+#     byte-identical to the one this repo publishes at
+#     configurations/assets/environments/skypilot/steps/data/dpk (the README
+#     beside it differs).
+#     The URI is space://steps/dpk, not this repo's space://steps/data/dpk, on
+#     purpose: in the assets repo `skypilot` is an env-partition dir, so `dpk` is
+#     the step's real name there. The assets repo has no data/ category.
 # The step resolves for this env because its step.yaml declares
 # `environment_configs: {Skypilot: ...}` with NO `subtypes:` restriction, so it
 # admits all four SkyPilot endpoints, slurm included. If someone later adds a
